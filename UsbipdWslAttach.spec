@@ -4,6 +4,8 @@
 # Then build the setup EXE (requires Inno Setup 6):
 #   .\scripts\build_installer.ps1
 
+import sys
+
 from PyInstaller.utils.hooks import collect_all
 
 datas = [("assets", "assets")]
@@ -13,6 +15,13 @@ tmp_ret = collect_all("flet")
 datas += tmp_ret[0]
 binaries += tmp_ret[1]
 hiddenimports += tmp_ret[2]
+# Flet on Windows uses the separate flet_desktop (pip: flet-desktop) native shell; it is not
+# re-exported by the base "flet" tree, so the frozen app must bundle it.
+if sys.platform == "win32":
+    tmp_ret = collect_all("flet_desktop")
+    datas += tmp_ret[0]
+    binaries += tmp_ret[1]
+    hiddenimports += tmp_ret[2]
 for pkg in ("pystray", "PIL"):
     t = collect_all(pkg)
     datas += t[0]
