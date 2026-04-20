@@ -1,0 +1,97 @@
+# Builds the Windows installer: PyInstaller onedir, then Inno Setup 6.
+# - Push / PR / workflow_dispatch: artifact only.
+# - Published release: #define MyAppVersion in the Inno script is set from the release tag, then
+#   the same EXE is attached to that release.
+name: Build installer
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  inno-installer:
+    runs-on: windows-latest
+    env:
+      USBIPD_BUILD_PYTHON: python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Inno version from release tag
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if (-not $env:TAG) { throw "No release tag" }
+          $ver = $env:TAG -replace '^v', ''
+          if ($ver -notmatch '^(0|[1-9]\d*)\.\d+\.\d+') {
+            Write-Warning "Tag '$ver' is not a simple x.y.z semver; Inno/VersionInfo may not accept it."
+          }
+          $iss = "packaging\UsbipdWslAttach.iss"
+          (Get-Content -LiteralPath $iss) | ForEach-Object {
+            if ($_ -match '^\#define MyAppVersion ') { '#define MyAppVersion "' + $ver + '"' } else { $_ }
+          } | Set-Content -LiteralPath $iss
+          Write-Host "MyAppVersion set to $ver (from tag $env:TAG)"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "pyinstaller>=6.0"
+
+      - name: Install Inno Setup 6
+        run: choco install innosetup -y
+
+      - name: Compile and build installer
+        run: |
+          python -m compileall usbipd_attach_manager
+          & "${{ github.workspace }}\scripts\build_installer.ps1"
+        shell: pwsh
+
+      - name: Upload setup EXE (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: UsbipdWslAttach-Setup
+          path: dist-installer/
+          if-no-files-found: error
+
+  # Separate job: default token can stay read-only for the Windows build; uploading release assets
+  # only needs `contents: write` on the repo that hosts the release.
+  attach-to-release:
+    if: github.event_name == 'release'
+    needs: inno-installer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: UsbipdWslAttach-Setup
+          path: dist-installer
+
+      - name: Upload EXE to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          for f in dist-installer/UsbipdWslAttach-Setup-*.exe; do
+            if [ -f "$f" ]; then
+              gh release upload "${{ github.event.release.tag_name }}" "$f" --clobber
+            else
+              echo "No EXE in dist-installer"
+              exit 1
+            fi
+          done
