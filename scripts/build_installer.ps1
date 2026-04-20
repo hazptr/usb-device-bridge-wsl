@@ -16,13 +16,20 @@ if (-not $python) {
 $buildVerFile = Join-Path $repoRoot "packaging\build_version.txt"
 $oldEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-$desc = & git -C $repoRoot describe --tags --long --match "v*" --always 2>$null
+$desc = & git -C $repoRoot describe --tags --long --match "v*" --always --dirty 2>$null
 $ErrorActionPreference = $oldEap
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($desc)) {
     $desc = & $python -c "import pathlib, sys, tomllib; p=pathlib.Path(sys.argv[1])/'pyproject.toml'; print(tomllib.loads(p.read_bytes().decode())['project']['version'])" $repoRoot
     if ($LASTEXITCODE -ne 0) { $desc = "0.0.0" }
 }
 $desc = [string]($desc).Trim()
+if ((Test-Path -LiteralPath (Join-Path $repoRoot ".git")) -and -not $desc.EndsWith("-dirty")) {
+    $oldEap2 = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $porcelain = & git -C $repoRoot status --porcelain 2>$null
+    $ErrorActionPreference = $oldEap2
+    if ($LASTEXITCODE -eq 0 -and $porcelain) { $desc = "$desc-dirty" }
+}
 $dirPack = Split-Path -Parent $buildVerFile
 if (-not (Test-Path -LiteralPath $dirPack)) { New-Item -ItemType Directory -Path $dirPack -Force | Out-Null }
 Set-Content -LiteralPath $buildVerFile -Value $desc -Encoding utf8 -NoNewline

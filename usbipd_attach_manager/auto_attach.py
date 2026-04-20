@@ -3,10 +3,13 @@
 Product intent: see ``AGENTS.md`` (section “Remembered devices”).
 
 Remembered devices use **usbipd’s built-in auto-attach** (``usbipd attach … -a``), one
-long-running subprocess per device while attach is still in progress. ``sync`` is
-called on the UI poll timer to start/stop those helpers as plug state and BusId
-change, and to **stop** the helper when the device is already attached (so we do
-not respawn in a tight loop). Exits are logged; respawns use a short backoff.
+long-running subprocess per device while attach is still in progress. ``usbipd`` keeps
+that listener alive across unplug/replug at the same BusId; ``sync`` therefore **does
+not** stop a live listener just because the device row disappears or is transiently
+offline. It stops the helper when the device is already attached, when the BusId for
+that instance changes (new listener needed), on user cancel / shutdown, or when a
+listener exceeds a wall-clock safety timeout. Dead listeners are reaped so a new one
+can be spawned when the device is connectable again. Respawns use a short backoff.
 """
 
 from __future__ import annotations
@@ -28,6 +31,10 @@ _log = logging.getLogger(__name__)
 # Minimum seconds between spawning a new ``attach -a`` for the same instance after
 # the previous process exited (avoids log/UI thrash if usbipd exits quickly on error).
 _MIN_RESPAWN_INTERVAL_SEC = 2.0
+
+# If ``attach -a`` stays running this long without the device becoming attached, stop
+# it so a stuck listener cannot run forever (BusId changes still force a respawn sooner).
+_LISTENER_MAX_WALL_SEC = 3600.0
 
 
 def _terminate_process(proc: subprocess.Popen[Any], detail: str) -> None:
@@ -106,15 +113,12 @@ class AutoAttachManager:
     """Runs ``usbipd attach -a`` helpers per remembered device (with bind when needed)."""
 
     def __init__(self) -> None:
-        self._procs: dict[str, tuple[subprocess.Popen[Any], str]] = {}
+        # ``start_mono`` is ``time.monotonic()`` when this listener was spawned.
+        self._procs: dict[str, tuple[subprocess.Popen[Any], str, float]] = {}
         self._last_spawn_mono: dict[str, float] = {}
 
     def running_count(self) -> int:
-        return sum(
-            1
-            for p, _ in self._procs.values()
-            if p.poll() is None
-        )
+        return sum(1 for p, *_rest in self._procs.values() if p.poll() is None)
 
     def terminate_all(self) -> None:
         keys = list(self._procs.keys())
@@ -130,7 +134,7 @@ class AutoAttachManager:
         self._last_spawn_mono.pop(instance_id, None)
         t = self._procs.pop(instance_id, None)
         if t:
-            proc, bus_id = t
+            proc, bus_id, _started = t
             _log.info(
                 "Auto-attach subtask cleanup: instance_id=%s bus_id=%s reason=%s",
                 instance_id,
@@ -145,6 +149,24 @@ class AutoAttachManager:
     def cancel_background_attach(self, instance_id: str) -> None:
         """Stop the background ``usbipd attach -a`` subtask for one device."""
         self._terminate_one(instance_id, "user_cancel")
+
+    def _reap_if_dead(self, instance_id: str, reason: str) -> None:
+        """Remove a finished listener from bookkeeping (process already exited)."""
+        t = self._procs.get(instance_id)
+        if not t:
+            return
+        proc, bus_id, _started = t
+        if proc.poll() is None:
+            return
+        _log.info(
+            "Auto-attach listener exited (pid was %s), reaping: instance_id=%s "
+            "bus_id=%s reason=%s",
+            proc.pid,
+            instance_id,
+            bus_id,
+            reason,
+        )
+        self._procs.pop(instance_id, None)
 
     def sync(
         self,
@@ -168,32 +190,38 @@ class AutoAttachManager:
                 self._terminate_one(inst, "no longer remembered")
 
         for inst in remember_ids:
-            dev = by_inst.get(inst)
-            if not dev:
-                self._terminate_one(inst, "missing from usbipd state")
-                continue
-
             distro = distro_for_instance(inst)
             if not distro:
                 self._terminate_one(inst, "no distro for device")
                 continue
 
-            bid = dev.get("BusId")
-            st = classify(dev)
-            if not bid:
-                self._terminate_one(inst, "no BusId")
+            t_live = self._procs.get(inst)
+            if t_live:
+                proc_w, _bus_w, started = t_live
+                if (
+                    proc_w.poll() is None
+                    and (time.monotonic() - started) > _LISTENER_MAX_WALL_SEC
+                ):
+                    self._terminate_one(
+                        inst,
+                        f"attach -a listener exceeded {_LISTENER_MAX_WALL_SEC:.0f}s",
+                    )
+                    continue
+
+            dev = by_inst.get(inst)
+            if not dev:
+                self._reap_if_dead(inst, "device missing from usbipd state")
                 continue
 
-            if st == "offline":
-                self._terminate_one(inst, "device offline")
-                continue
+            bid = dev.get("BusId")
+            st = classify(dev)
 
             if st == "attached":
                 # Connected — stop the ``-a`` helper; do not spawn another.
                 self._terminate_one(inst, "already attached to client")
                 continue
 
-            if st in ("available", "shared"):
+            if st in ("available", "shared") and bid:
                 self._ensure_running(
                     usbipd,
                     distro,
@@ -203,7 +231,11 @@ class AutoAttachManager:
                 )
                 continue
 
-            self._terminate_one(inst, f"unexpected state: {st}")
+            # Unplug / transient: keep a live ``-a`` listener; only reap if it exited.
+            self._reap_if_dead(
+                inst,
+                f"waiting (state={st!r} bus_id={bid!r})",
+            )
 
     def _ensure_running(
         self,
@@ -215,7 +247,7 @@ class AutoAttachManager:
         need_bind: bool,
     ) -> None:
         if instance_id in self._procs:
-            proc, old_bid = self._procs[instance_id]
+            proc, old_bid, _old_start = self._procs[instance_id]
             if old_bid != bus_id:
                 self._terminate_one(instance_id, f"BusId changed ({old_bid!r} -> {bus_id!r})")
             elif proc.poll() is None:
@@ -252,8 +284,9 @@ class AutoAttachManager:
                 return
 
         proc = _spawn_auto_attach(usbipd, distro, bus_id)
-        self._procs[instance_id] = (proc, bus_id)
-        self._last_spawn_mono[instance_id] = time.monotonic()
+        now = time.monotonic()
+        self._procs[instance_id] = (proc, bus_id, now)
+        self._last_spawn_mono[instance_id] = now
 
     def instance_ids_attaching(
         self,
@@ -269,12 +302,10 @@ class AutoAttachManager:
             pair = self._procs.get(inst)
             if not pair:
                 continue
-            proc, _bus = pair
+            proc, _bus, _started = pair
             if proc.poll() is not None:
                 continue
             dev = by_inst.get(inst)
-            if dev is None:
-                continue
-            if classify(dev) != "attached":
+            if dev is None or classify(dev) != "attached":
                 out.add(inst)
         return out

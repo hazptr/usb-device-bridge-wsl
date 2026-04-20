@@ -61,6 +61,25 @@ def _strip_v_prefix(s: str) -> str:
     return t
 
 
+def _format_describe_for_display(s: str) -> str:
+    """
+    ``git describe --long`` on an exact tag looks like ``1.0.1-0-gabc``. For
+    release builds, show only the tag / semver part (plus ``-dirty`` if present).
+    """
+    t = s.strip()
+    m = re.match(
+        r"^(.*)-(\d+)-g([0-9a-f]+)(-dirty)?$",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return t
+    prefix, distance, dirty = m.group(1), int(m.group(2)), m.group(4)
+    if distance != 0:
+        return t
+    return prefix + (dirty or "")
+
+
 def _read_frozen_build_version() -> str | None:
     if not getattr(sys, "frozen", False):
         return None
@@ -93,6 +112,7 @@ def _git_describe_text() -> str | None:
                 "--match",
                 "v*",
                 "--always",
+                "--dirty",
             ),
             capture_output=True,
             text=True,
@@ -106,20 +126,42 @@ def _git_describe_text() -> str | None:
     return _strip_v_prefix(cp.stdout.strip())
 
 
+def _git_worktree_dirty() -> bool:
+    root = _repo_root()
+    if not (root / ".git").is_dir():
+        return False
+    try:
+        cp = subprocess.run(
+            ("git", "-C", str(root), "status", "--porcelain"),
+            capture_output=True,
+            text=True,
+            timeout=8.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return cp.returncode == 0 and bool((cp.stdout or "").strip())
+
+
 @lru_cache
 def get_display_version() -> str:
     """
     Version string for UI, including commits-after-tag from ``git describe``
-    (or the same string embedded at PyInstaller build time). Falls back to
-    :func:`get_app_version` when neither is available.
+    (or the same string embedded at PyInstaller build time). Uncommitted
+    changes append ``-dirty``. Checkouts exactly on a release tag show only
+    the semver (no ``-0-g<hash>``). Falls back to :func:`get_app_version`
+    when neither is available.
     """
     frozen = _read_frozen_build_version()
     if frozen:
-        return frozen
+        return _format_describe_for_display(frozen)
     g = _git_describe_text()
     if g:
-        return g
-    return get_app_version()
+        return _format_describe_for_display(g)
+    base = get_app_version()
+    if _git_worktree_dirty():
+        return f"{base}-dirty"
+    return base
 
 
 def _version_tuple(v: str) -> tuple[int, ...]:
