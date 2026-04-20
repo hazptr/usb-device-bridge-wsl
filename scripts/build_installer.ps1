@@ -12,6 +12,22 @@ if (-not $python) {
     else { $python = "python" }
 }
 
+# Embed git describe (commits after last v* tag) for the in-app title bar; PyInstaller picks it up from packaging\build_version.txt
+$buildVerFile = Join-Path $repoRoot "packaging\build_version.txt"
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$desc = & git -C $repoRoot describe --tags --long --match "v*" --always 2>$null
+$ErrorActionPreference = $oldEap
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($desc)) {
+    $desc = & $python -c "import pathlib, sys, tomllib; p=pathlib.Path(sys.argv[1])/'pyproject.toml'; print(tomllib.loads(p.read_bytes().decode())['project']['version'])" $repoRoot
+    if ($LASTEXITCODE -ne 0) { $desc = "0.0.0" }
+}
+$desc = [string]($desc).Trim()
+$dirPack = Split-Path -Parent $buildVerFile
+if (-not (Test-Path -LiteralPath $dirPack)) { New-Item -ItemType Directory -Path $dirPack -Force | Out-Null }
+Set-Content -LiteralPath $buildVerFile -Value $desc -Encoding utf8 -NoNewline
+Write-Host "Build version (title bar / embedded): $desc" -ForegroundColor Cyan
+
 Write-Host "PyInstaller (onedir) via $python..." -ForegroundColor Cyan
 & $python -m PyInstaller --noconfirm UsbipdWslAttach.spec
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -22,6 +22,8 @@ jobs:
       USBIPD_BUILD_PYTHON: python
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set Inno version from release tag
         if: github.event_name == 'release'

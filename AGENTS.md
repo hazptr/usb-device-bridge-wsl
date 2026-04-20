@@ -37,6 +37,7 @@ Unless a task explicitly changes this story, preserve the intent. **How** you im
 
 ### Tray and window behavior
 
+- The custom title bar (and related window title) should show a build identifier such as a `git describe` string (version, commits after the last `v*` tag, and short hash) so `main` and other builds are easy to tell apart.
 - If the product offers minimizing to the notification area, closing or minimizing should follow what the user selected (window vs tray), and the user should be able to open or exit from the tray in a predictable way.
 - **Full exit** (window close or Exit from the tray when not using “to tray” for that action) should **detach and unbind** devices that were shared or attached via usbipd, so USB is no longer in use through this app after it closes. **Do not** tear down attachment when a **new instance replaces** the current one (same app handoff), so the replacement can keep working without a gap.
 

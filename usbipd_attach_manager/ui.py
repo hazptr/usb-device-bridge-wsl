@@ -41,6 +41,7 @@ from usbipd_attach_manager.usbipd import (
     usbipd_disconnect_fully,
     vid_pid_from_instance,
 )
+from usbipd_attach_manager.version_info import get_display_version
 from usbipd_attach_manager.windows_startup import (
     can_configure_run_at_logon,
     is_run_at_logon_enabled,
@@ -99,7 +100,8 @@ def _assets_dir() -> Path:
 
 async def run_app(page: ft.Page) -> None:
     install_asyncio_exception_logging()
-    page.title = "USB/IP → WSL"
+    _win_title = f"USB/IP → WSL — {get_display_version()}"
+    page.title = _win_title
     ico = _assets_dir() / "app_icon.ico"
     if ico.is_file():
         page.window.icon = str(ico)
@@ -229,7 +231,7 @@ async def run_app(page: ft.Page) -> None:
 
     status_text = ft.Text("", color="#94a3b8", size=11, expand=True)
     title_heading = ft.Text(
-        "USB/IP → WSL",
+        _win_title,
         size=13,
         weight=ft.FontWeight.W_600,
         color="#f1f5f9",
@@ -291,7 +293,7 @@ async def run_app(page: ft.Page) -> None:
     auto_attach_manager = AutoAttachManager()
     atexit.register(auto_attach_manager.terminate_all)
     _shutdown_started = [False]
-    tray = TrayManager(ico, page.title or "USB/IP → WSL")
+    tray = TrayManager(ico, _win_title)
 
     async def show_from_tray() -> None:
         page.window.visible = True

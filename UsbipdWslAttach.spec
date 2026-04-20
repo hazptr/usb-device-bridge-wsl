@@ -5,10 +5,14 @@
 #   .\scripts\build_installer.ps1
 
 import sys
+from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
 
 datas = [("assets", "assets")]
+_build_version = Path("packaging") / "build_version.txt"
+if _build_version.is_file():
+    datas += [(str(_build_version), "usbipd_attach_manager")]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all("flet")
