@@ -85,6 +85,8 @@ jobs:
       - name: Upload EXE to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job: gh would otherwise look for .git in the working directory.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -e
           for f in dist-installer/UsbipdWslAttach-Setup-*.exe; do
