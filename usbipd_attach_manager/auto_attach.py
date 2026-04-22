@@ -14,7 +14,10 @@ can be spawned when the device is connectable again. Respawns use a short backof
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 import subprocess
 import sys
 import time
@@ -32,9 +35,148 @@ _log = logging.getLogger(__name__)
 # the previous process exited (avoids log/UI thrash if usbipd exits quickly on error).
 _MIN_RESPAWN_INTERVAL_SEC = 2.0
 
-# If ``attach -a`` stays running this long without the device becoming attached, stop
-# it so a stuck listener cannot run forever (BusId changes still force a respawn sooner).
-_LISTENER_MAX_WALL_SEC = 3600.0
+# Adaptive timeout/backoff when a listener stays alive but the device is still not
+# attached: 10s, 20s, 40s, 80s, 160s, then cap at 300s.
+_INITIAL_LISTENER_TIMEOUT_SEC = 10.0
+_MAX_LISTENER_TIMEOUT_SEC = 300.0
+_MAX_ATTACH_ATTEMPTS = 6
+_LONG_WAIT_UI_THRESHOLD_SEC = 30.0
+_ADOPT_SCAN_INTERVAL_SEC = 15.0
+_DIRECT_ATTACH_TIMEOUT_SEC = 45.0
+
+
+def _listener_timeout_for_attempt(attempt_no: int) -> float:
+    clamped = max(1, min(attempt_no, _MAX_ATTACH_ATTEMPTS))
+    return min(
+        _INITIAL_LISTENER_TIMEOUT_SEC * (2 ** (clamped - 1)),
+        _MAX_LISTENER_TIMEOUT_SEC,
+    )
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=10,
+                creationflags=_WIN_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        out = (r.stdout or "").strip()
+        if not out:
+            return False
+        if "No tasks are running" in out:
+            return False
+        return f'"{pid}"' in out or (str(pid) in out and "usbipd" in out.lower())
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_pid_tree(pid: int, detail: str) -> None:
+    _log.info("Auto-attach external listener stopping (pid=%s): %s", pid, detail)
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+                creationflags=_WIN_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+
+
+def _parse_auto_attach_cmdline(cmdline: str) -> tuple[str | None, str] | None:
+    if not cmdline:
+        return None
+    if not re.search(r"(?:^|\s)attach(?:\s|$)", cmdline, re.IGNORECASE):
+        return None
+    if not re.search(r"(?:^|\s)-a(?:\s|$)", cmdline, re.IGNORECASE):
+        return None
+    m_bus = re.search(
+        r"(?:^|\s)(?:-b|--busid)(?:\s+|=)(?:\"([^\"]+)\"|([^\s]+))",
+        cmdline,
+        re.IGNORECASE,
+    )
+    if not m_bus:
+        return None
+    bus_id = (m_bus.group(1) or m_bus.group(2) or "").strip()
+    if not bus_id:
+        return None
+    m_distro = re.search(
+        r"(?:^|\s)--wsl(?:\s+|=)(?:\"([^\"]+)\"|([^\s]+))",
+        cmdline,
+        re.IGNORECASE,
+    )
+    distro = None
+    if m_distro:
+        distro = (m_distro.group(1) or m_distro.group(2) or "").strip() or None
+    return distro, bus_id
+
+
+def _list_existing_auto_attach_processes() -> list[tuple[int, str, str | None]]:
+    if sys.platform != "win32":
+        return []
+    ps = (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "Get-CimInstance Win32_Process -Filter \"Name='usbipd.exe'\" | "
+        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+            creationflags=_WIN_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    raw = (r.stdout or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    rows = parsed if isinstance(parsed, list) else [parsed]
+    out: list[tuple[int, str, str | None]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            pid = int(row.get("ProcessId") or 0)
+        except (TypeError, ValueError):
+            continue
+        cmdline = str(row.get("CommandLine") or "")
+        parsed_cmd = _parse_auto_attach_cmdline(cmdline)
+        if not parsed_cmd:
+            continue
+        distro, bus_id = parsed_cmd
+        out.append((pid, bus_id, distro))
+    return out
 
 
 def _terminate_process(proc: subprocess.Popen[Any], detail: str) -> None:
@@ -115,13 +257,29 @@ class AutoAttachManager:
     def __init__(self) -> None:
         # ``start_mono`` is ``time.monotonic()`` when this listener was spawned.
         self._procs: dict[str, tuple[subprocess.Popen[Any], str, float]] = {}
+        self._external_procs: dict[str, tuple[int, str, float]] = {}
         self._last_spawn_mono: dict[str, float] = {}
+        self._last_adopt_scan_mono = 0.0
+        self._attempt_no: dict[str, int] = {}
+        self._failed: dict[str, str] = {}
+
+    def _reset_retry_state(self, instance_id: str) -> None:
+        self._attempt_no.pop(instance_id, None)
+        self._failed.pop(instance_id, None)
+
+    def failed_instance_ids(self) -> set[str]:
+        return set(self._failed.keys())
+
+    def failure_for_instance(self, instance_id: str) -> str | None:
+        return self._failed.get(instance_id)
 
     def running_count(self) -> int:
-        return sum(1 for p, *_rest in self._procs.values() if p.poll() is None)
+        own = sum(1 for p, *_rest in self._procs.values() if p.poll() is None)
+        ext = sum(1 for pid, *_rest in self._external_procs.values() if _pid_is_running(pid))
+        return own + ext
 
     def terminate_all(self) -> None:
-        keys = list(self._procs.keys())
+        keys = sorted(set(self._procs.keys()) | set(self._external_procs.keys()))
         if keys:
             _log.info(
                 "Auto-attach cleanup: stopping %d background subtask(s)",
@@ -130,8 +288,16 @@ class AutoAttachManager:
         for inst in keys:
             self._terminate_one(inst, "terminate_all")
 
-    def _terminate_one(self, instance_id: str, reason: str) -> None:
+    def _terminate_one(
+        self,
+        instance_id: str,
+        reason: str,
+        *,
+        clear_retry_state: bool = True,
+    ) -> None:
         self._last_spawn_mono.pop(instance_id, None)
+        if clear_retry_state:
+            self._reset_retry_state(instance_id)
         t = self._procs.pop(instance_id, None)
         if t:
             proc, bus_id, _started = t
@@ -145,28 +311,134 @@ class AutoAttachManager:
                 proc,
                 f"instance_id={instance_id}, bus_id={bus_id}, reason={reason}",
             )
+        ext = self._external_procs.pop(instance_id, None)
+        if ext:
+            pid, bus_id, _started = ext
+            _terminate_pid_tree(
+                pid,
+                f"instance_id={instance_id}, bus_id={bus_id}, reason={reason}",
+            )
 
     def cancel_background_attach(self, instance_id: str) -> None:
         """Stop the background ``usbipd attach -a`` subtask for one device."""
         self._terminate_one(instance_id, "user_cancel")
 
+    def retry_background_attach(self, instance_id: str) -> None:
+        """Force-restart background auto-attach and clear failure/retry state."""
+        self._reset_retry_state(instance_id)
+        t = self._procs.get(instance_id)
+        ext = self._external_procs.get(instance_id)
+        if t or ext:
+            self._terminate_one(
+                instance_id,
+                "user_retry",
+                clear_retry_state=False,
+            )
+        else:
+            self._last_spawn_mono.pop(instance_id, None)
+
     def _reap_if_dead(self, instance_id: str, reason: str) -> None:
         """Remove a finished listener from bookkeeping (process already exited)."""
         t = self._procs.get(instance_id)
-        if not t:
+        if t:
+            proc, bus_id, _started = t
+            if proc.poll() is None:
+                return
+            _log.info(
+                "Auto-attach listener exited (pid was %s), reaping: instance_id=%s "
+                "bus_id=%s reason=%s",
+                proc.pid,
+                instance_id,
+                bus_id,
+                reason,
+            )
+            self._procs.pop(instance_id, None)
             return
-        proc, bus_id, _started = t
-        if proc.poll() is None:
+        ext = self._external_procs.get(instance_id)
+        if not ext:
+            return
+        pid, bus_id, _started = ext
+        if _pid_is_running(pid):
             return
         _log.info(
-            "Auto-attach listener exited (pid was %s), reaping: instance_id=%s "
-            "bus_id=%s reason=%s",
-            proc.pid,
+            "Adopted auto-attach listener exited (pid was %s), reaping: "
+            "instance_id=%s bus_id=%s reason=%s",
+            pid,
             instance_id,
             bus_id,
             reason,
         )
-        self._procs.pop(instance_id, None)
+        self._external_procs.pop(instance_id, None)
+
+    def _adopt_existing_listeners(
+        self,
+        remember_ids: set[str],
+        by_inst: dict[str, dict[str, Any]],
+        distro_for_instance: Callable[[str], str | None],
+    ) -> None:
+        inst_for_bus: dict[str, str] = {}
+        for inst in remember_ids:
+            dev = by_inst.get(inst)
+            if not dev:
+                continue
+            bus_id = (dev.get("BusId") or "").strip()
+            if bus_id:
+                inst_for_bus[bus_id] = inst
+        if not inst_for_bus:
+            return
+        for pid, bus_id, distro in _list_existing_auto_attach_processes():
+            inst = inst_for_bus.get(bus_id)
+            if not inst:
+                continue
+            if inst in self._procs or inst in self._external_procs:
+                continue
+            expected_distro = distro_for_instance(inst)
+            if expected_distro and distro and expected_distro.lower() != distro.lower():
+                _log.info(
+                    "Skipping adopt for instance_id=%s bus_id=%s due to distro mismatch "
+                    "(running=%r expected=%r)",
+                    inst,
+                    bus_id,
+                    distro,
+                    expected_distro,
+                )
+                continue
+            self._external_procs[inst] = (pid, bus_id, time.monotonic())
+            self._attempt_no.setdefault(inst, 1)
+            _log.info(
+                "Adopted existing usbipd attach -a listener "
+                "(pid=%s, instance_id=%s, bus_id=%s)",
+                pid,
+                inst,
+                bus_id,
+            )
+
+    def _try_direct_attach_once(
+        self,
+        usbipd: str,
+        distro: str,
+        instance_id: str,
+        bus_id: str,
+    ) -> bool:
+        code, out, err = run_cmd(
+            usbipd,
+            ["attach", "--wsl", distro, "-b", bus_id],
+            timeout=_DIRECT_ATTACH_TIMEOUT_SEC,
+        )
+        if code == 0:
+            _log.info(
+                "Direct attach fallback succeeded (instance_id=%s bus_id=%s)",
+                instance_id,
+                bus_id,
+            )
+            return True
+        _log.warning(
+            "Direct attach fallback failed (instance_id=%s bus_id=%s): %s",
+            instance_id,
+            bus_id,
+            err or out or "attach failed",
+        )
+        return False
 
     def sync(
         self,
@@ -176,6 +448,7 @@ class AutoAttachManager:
         distro_for_instance: Callable[[str], str | None],
     ) -> None:
         if not remember_ids:
+            self._last_adopt_scan_mono = 0.0
             self.terminate_all()
             return
 
@@ -185,28 +458,23 @@ class AutoAttachManager:
             if d.get("InstanceId")
         }
 
-        for inst in list(self._procs.keys()):
+        now = time.monotonic()
+        if now - self._last_adopt_scan_mono >= _ADOPT_SCAN_INTERVAL_SEC:
+            self._last_adopt_scan_mono = now
+            self._adopt_existing_listeners(remember_ids, by_inst, distro_for_instance)
+
+        for inst in list(set(self._procs.keys()) | set(self._external_procs.keys())):
             if inst not in remember_ids:
                 self._terminate_one(inst, "no longer remembered")
+        for inst in list(self._failed.keys()):
+            if inst not in remember_ids:
+                self._reset_retry_state(inst)
 
         for inst in remember_ids:
             distro = distro_for_instance(inst)
             if not distro:
                 self._terminate_one(inst, "no distro for device")
                 continue
-
-            t_live = self._procs.get(inst)
-            if t_live:
-                proc_w, _bus_w, started = t_live
-                if (
-                    proc_w.poll() is None
-                    and (time.monotonic() - started) > _LISTENER_MAX_WALL_SEC
-                ):
-                    self._terminate_one(
-                        inst,
-                        f"attach -a listener exceeded {_LISTENER_MAX_WALL_SEC:.0f}s",
-                    )
-                    continue
 
             dev = by_inst.get(inst)
             if not dev:
@@ -246,12 +514,127 @@ class AutoAttachManager:
         *,
         need_bind: bool,
     ) -> None:
-        if instance_id in self._procs:
-            proc, old_bid, _old_start = self._procs[instance_id]
+        if instance_id in self._failed:
+            return
+
+        if instance_id in self._external_procs:
+            pid, old_bid, old_start = self._external_procs[instance_id]
             if old_bid != bus_id:
-                self._terminate_one(instance_id, f"BusId changed ({old_bid!r} -> {bus_id!r})")
+                self._terminate_one(
+                    instance_id,
+                    f"BusId changed ({old_bid!r} -> {bus_id!r})",
+                )
+            elif _pid_is_running(pid):
+                now = time.monotonic()
+                attempt_no = self._attempt_no.get(instance_id, 1)
+                timeout_sec = _listener_timeout_for_attempt(attempt_no)
+                elapsed_sec = now - old_start
+                if elapsed_sec <= timeout_sec:
+                    return
+
+                if attempt_no >= _MAX_ATTACH_ATTEMPTS:
+                    self._terminate_one(
+                        instance_id,
+                        (
+                            "auto-attach failed after "
+                            f"{_MAX_ATTACH_ATTEMPTS} attempts (timeout {timeout_sec:.0f}s)"
+                        ),
+                        clear_retry_state=False,
+                    )
+                    msg = (
+                        "Auto-attach failed after multiple attempts. "
+                        "Try reconnecting the device or toggle Remember off/on."
+                    )
+                    self._failed[instance_id] = msg
+                    _log.error(
+                        "Auto-attach giving up on adopted listener: "
+                        "instance_id=%s bus_id=%s attempts=%s",
+                        instance_id,
+                        bus_id,
+                        attempt_no,
+                    )
+                    return
+
+                next_attempt = attempt_no + 1
+                self._try_direct_attach_once(usbipd, distro, instance_id, bus_id)
+                _log.warning(
+                    "Auto-attach timeout on adopted listener: restarting "
+                    "instance_id=%s bus_id=%s attempt=%s timeout=%.0fs next_attempt=%s",
+                    instance_id,
+                    bus_id,
+                    attempt_no,
+                    timeout_sec,
+                    next_attempt,
+                )
+                self._terminate_one(
+                    instance_id,
+                    f"adopted attach -a timed out after {elapsed_sec:.1f}s",
+                    clear_retry_state=False,
+                )
+                self._attempt_no[instance_id] = next_attempt
+            else:
+                _log.info(
+                    "Adopted attach -a process ended (instance_id=%s bus_id=%s pid=%s)",
+                    instance_id,
+                    bus_id,
+                    pid,
+                )
+                del self._external_procs[instance_id]
+
+        if instance_id in self._procs:
+            proc, old_bid, old_start = self._procs[instance_id]
+            if old_bid != bus_id:
+                self._terminate_one(
+                    instance_id,
+                    f"BusId changed ({old_bid!r} -> {bus_id!r})",
+                )
             elif proc.poll() is None:
-                return
+                now = time.monotonic()
+                attempt_no = self._attempt_no.get(instance_id, 1)
+                timeout_sec = _listener_timeout_for_attempt(attempt_no)
+                elapsed_sec = now - old_start
+                if elapsed_sec <= timeout_sec:
+                    return
+
+                if attempt_no >= _MAX_ATTACH_ATTEMPTS:
+                    self._terminate_one(
+                        instance_id,
+                        (
+                            "auto-attach failed after "
+                            f"{_MAX_ATTACH_ATTEMPTS} attempts (timeout {timeout_sec:.0f}s)"
+                        ),
+                        clear_retry_state=False,
+                    )
+                    msg = (
+                        "Auto-attach failed after multiple attempts. "
+                        "Try reconnecting the device or toggle Remember off/on."
+                    )
+                    self._failed[instance_id] = msg
+                    _log.error(
+                        "Auto-attach giving up: instance_id=%s bus_id=%s attempts=%s",
+                        instance_id,
+                        bus_id,
+                        attempt_no,
+                    )
+                    return
+
+                next_attempt = attempt_no + 1
+                self._try_direct_attach_once(usbipd, distro, instance_id, bus_id)
+                _log.warning(
+                    "Auto-attach timeout: restarting listener instance_id=%s bus_id=%s "
+                    "attempt=%s timeout=%.0fs next_attempt=%s",
+                    instance_id,
+                    bus_id,
+                    attempt_no,
+                    timeout_sec,
+                    next_attempt,
+                )
+                self._terminate_one(
+                    instance_id,
+                    f"attach -a timed out after {elapsed_sec:.1f}s",
+                    clear_retry_state=False,
+                )
+                self._attempt_no[instance_id] = next_attempt
             else:
                 exit_code = proc.poll()
                 _log.info(
@@ -283,6 +666,7 @@ class AutoAttachManager:
                 )
                 return
 
+        self._attempt_no.setdefault(instance_id, 1)
         proc = _spawn_auto_attach(usbipd, distro, bus_id)
         now = time.monotonic()
         self._procs[instance_id] = (proc, bus_id, now)
@@ -299,13 +683,53 @@ class AutoAttachManager:
             d["InstanceId"]: d for d in devs if d.get("InstanceId")
         }
         for inst in remember_ids:
+            live = False
             pair = self._procs.get(inst)
-            if not pair:
-                continue
-            proc, _bus, _started = pair
-            if proc.poll() is not None:
+            if pair:
+                proc, _bus, _started = pair
+                live = proc.poll() is None
+            else:
+                ext = self._external_procs.get(inst)
+                if ext:
+                    pid, _bus, _started = ext
+                    live = _pid_is_running(pid)
+            if not live:
                 continue
             dev = by_inst.get(inst)
             if dev is None or classify(dev) != "attached":
+                out.add(inst)
+        return out
+
+    def instance_ids_long_waiting(
+        self,
+        devs: list[dict[str, Any]],
+        remember_ids: set[str],
+        *,
+        threshold_sec: float = _LONG_WAIT_UI_THRESHOLD_SEC,
+    ) -> set[str]:
+        """Remembered devices still attaching after a long wait threshold."""
+        out: set[str] = set()
+        by_inst = {
+            d["InstanceId"]: d for d in devs if d.get("InstanceId")
+        }
+        now = time.monotonic()
+        for inst in remember_ids:
+            started = 0.0
+            live = False
+            pair = self._procs.get(inst)
+            if pair:
+                proc, _bus, started = pair
+                live = proc.poll() is None
+            else:
+                ext = self._external_procs.get(inst)
+                if ext:
+                    pid, _bus, started = ext
+                    live = _pid_is_running(pid)
+            if not live:
+                continue
+            dev = by_inst.get(inst)
+            if dev is not None and classify(dev) == "attached":
+                continue
+            if (now - started) >= threshold_sec:
                 out.add(inst)
         return out

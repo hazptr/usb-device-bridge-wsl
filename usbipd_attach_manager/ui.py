@@ -70,6 +70,8 @@ def _device_list_fingerprint(
     *,
     manual_attaching: set[str],
     auto_attaching_ids: set[str],
+    auto_failed_ids: set[str],
+    auto_long_wait_ids: set[str],
 ) -> str:
     """Stable hash for whether the rendered device list would change."""
     normalized = sorted(devs, key=lambda d: d.get("InstanceId") or "")
@@ -86,6 +88,8 @@ def _device_list_fingerprint(
             "dev": dev_prefs,
             "m": sorted(manual_attaching),
             "a": sorted(auto_attaching_ids),
+            "f": sorted(auto_failed_ids),
+            "l": sorted(auto_long_wait_ids),
         },
         sort_keys=True,
         default=str,
@@ -288,10 +292,21 @@ async def run_app(page: ft.Page) -> None:
     last_list_fingerprint: str | None = None
     manual_attaching: set[str] = set()
     manual_cancel_events: dict[str, asyncio.Event] = {}
+    seen_auto_failures: set[str] = set()
     poll_stop = asyncio.Event()
     install_cancel_holder: list[asyncio.Event | None] = [None]
     auto_attach_manager = AutoAttachManager()
-    atexit.register(auto_attach_manager.terminate_all)
+    preserve_auto_attach_on_exit = [False]
+
+    def _auto_attach_atexit_cleanup() -> None:
+        if preserve_auto_attach_on_exit[0]:
+            logging.getLogger(__name__).info(
+                "Skipping auto-attach cleanup during instance handoff."
+            )
+            return
+        auto_attach_manager.terminate_all()
+
+    atexit.register(_auto_attach_atexit_cleanup)
     _shutdown_started = [False]
     tray = TrayManager(ico, _win_title)
 
@@ -309,7 +324,9 @@ async def run_app(page: ft.Page) -> None:
         ev = install_cancel_holder[0]
         if ev is not None:
             ev.set()
-        auto_attach_manager.terminate_all()
+        preserve_auto_attach_on_exit[0] = bool(yield_to_replacement)
+        if not yield_to_replacement:
+            auto_attach_manager.terminate_all()
         if not yield_to_replacement:
             await asyncio.sleep(0.2)
             page.window.minimized = False
@@ -446,6 +463,30 @@ async def run_app(page: ft.Page) -> None:
 
         status_text.value = f"{len(devs)} device(s) — usbipd at {usbipd_exe}"
         remembered = remembered_instance_ids(cfg)
+        auto_failed_ids = auto_attach_manager.failed_instance_ids()
+        auto_long_wait_ids = auto_attach_manager.instance_ids_long_waiting(
+            devs,
+            remembered,
+        )
+        seen_auto_failures.intersection_update(auto_failed_ids)
+        new_auto_failures = auto_failed_ids - seen_auto_failures
+        if new_auto_failures:
+            failed_name = "remembered device"
+            for dev in devs:
+                inst = dev.get("InstanceId") or ""
+                if inst in new_auto_failures:
+                    failed_name = dev.get("Description") or failed_name
+                    break
+            count = len(new_auto_failures)
+            show_error(
+                (
+                    f"Auto-attach failed for {count} remembered device(s), including "
+                    f"{failed_name}."
+                )
+                if count > 1
+                else f"Auto-attach failed for remembered device: {failed_name}."
+            )
+            seen_auto_failures.update(new_auto_failures)
 
         async def cancel_attach_for_instance(instance_id: str) -> None:
             if not instance_id:
@@ -456,6 +497,12 @@ async def run_app(page: ft.Page) -> None:
                 await rebuild_devices()
                 return
             auto_attach_manager.cancel_background_attach(instance_id)
+            await rebuild_devices()
+
+        async def retry_auto_attach_for_instance(instance_id: str) -> None:
+            if not instance_id:
+                return
+            auto_attach_manager.retry_background_attach(instance_id)
             await rebuild_devices()
 
         async def toggle_remember(inst: str, checked: bool) -> None:
@@ -525,6 +572,8 @@ async def run_app(page: ft.Page) -> None:
             cfg,
             manual_attaching=manual_attaching,
             auto_attaching_ids=auto_busy_ids,
+            auto_failed_ids=auto_failed_ids,
+            auto_long_wait_ids=auto_long_wait_ids,
         )
         for dev in sort_devices_list(devs, order, cfg.get("device_recency") or {}):
             desc = dev.get("Description") or "(no description)"
@@ -546,6 +595,10 @@ async def run_app(page: ft.Page) -> None:
 
             vp = vid_pid_from_instance(inst) or "—"
             is_rem = inst in remembered
+            fail_msg = auto_attach_manager.failure_for_instance(inst) if inst else None
+            is_failed = bool(fail_msg)
+            is_auto_attaching = bool(inst) and inst in auto_busy_ids
+            is_long_wait = bool(inst) and inst in auto_long_wait_ids
             is_attaching = bool(inst) and (
                 inst in manual_attaching or inst in auto_busy_ids
             )
@@ -629,11 +682,30 @@ async def run_app(page: ft.Page) -> None:
                                             border_radius=2,
                                         ),
                                         ft.Text(
-                                            "Attaching…",
+                                            (
+                                                "This device is taking a long time to attach. Retry?"
+                                                if is_auto_attaching and is_long_wait
+                                                else "Attaching…"
+                                            ),
                                             size=10,
                                             color="#fbbf24",
                                             weight=ft.FontWeight.W_500,
                                             no_wrap=True,
+                                        ),
+                                        ft.TextButton(
+                                            "Retry",
+                                            visible=is_auto_attaching and is_long_wait,
+                                            style=ft.ButtonStyle(
+                                                color="#fbbf24",
+                                                padding=ft.padding.symmetric(
+                                                    horizontal=8,
+                                                    vertical=2,
+                                                ),
+                                            ),
+                                            tooltip="Restart auto-attach for this device",
+                                            on_click=lambda e, i=inst: page.run_task(
+                                                retry_auto_attach_for_instance, i
+                                            ),
                                         ),
                                         ft.IconButton(
                                             icon=ft.Icons.STOP_CIRCLE_OUTLINED,
@@ -652,6 +724,32 @@ async def run_app(page: ft.Page) -> None:
                             ),
                         ]
                         if is_attaching
+                        else [
+                            ft.Container(
+                                expand=True,
+                                padding=ft.padding.only(left=8),
+                                content=ft.Row(
+                                    [
+                                        ft.Icon(
+                                            ft.Icons.ERROR_OUTLINE,
+                                            size=16,
+                                            color="#fca5a5",
+                                        ),
+                                        ft.Text(
+                                            "Auto-attach failed",
+                                            size=10,
+                                            color="#fca5a5",
+                                            weight=ft.FontWeight.W_500,
+                                            no_wrap=True,
+                                            tooltip=fail_msg,
+                                        ),
+                                    ],
+                                    spacing=5,
+                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                ),
+                            ),
+                        ]
+                        if is_failed
                         else []
                     ),
                 ],
@@ -1216,12 +1314,19 @@ async def run_app(page: ft.Page) -> None:
             auto_busy = auto_attach_manager.instance_ids_attaching(
                 devs, remember_ids
             )
+            auto_failed = auto_attach_manager.failed_instance_ids()
+            auto_long_wait = auto_attach_manager.instance_ids_long_waiting(
+                devs,
+                remember_ids,
+            )
             new_fp = _device_list_fingerprint(
                 devs,
                 order,
                 cfg,
                 manual_attaching=manual_attaching,
                 auto_attaching_ids=auto_busy,
+                auto_failed_ids=auto_failed,
+                auto_long_wait_ids=auto_long_wait,
             )
             if (
                 last_list_fingerprint is not None

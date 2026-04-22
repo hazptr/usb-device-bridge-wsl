@@ -5,7 +5,7 @@
 ; Or: .\scripts\build_installer.ps1
 
 #define MyAppName "USB/IP to WSL Attach Manager"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppExeName "UsbipdWslAttach.exe"
 #define MyAppPublisher "usbipd-device-attach-manager"
 
