@@ -14,6 +14,7 @@ can be spawned when the device is connectable again. Respawns use a short backof
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -24,7 +25,11 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from usbipd_attach_manager.process import run_cmd
+from usbipd_attach_manager.process import run_cmd, run_cmd_stream_merged_async
+from usbipd_attach_manager.firewall import (
+    apply_wsl_public_profile_firewall_fix,
+    usbipd_output_suggests_firewall_block,
+)
 from usbipd_attach_manager.usbipd import classify
 
 _WIN_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -42,7 +47,8 @@ _MAX_LISTENER_TIMEOUT_SEC = 300.0
 _MAX_ATTACH_ATTEMPTS = 6
 _LONG_WAIT_UI_THRESHOLD_SEC = 30.0
 _ADOPT_SCAN_INTERVAL_SEC = 15.0
-_DIRECT_ATTACH_TIMEOUT_SEC = 45.0
+_DIRECT_ATTACH_TIMEOUT_SEC = 15.0
+_FIREWALL_PROMPT_REQUEUE_COOLDOWN_SEC = 20.0
 
 
 def _listener_timeout_for_attempt(attempt_no: int) -> float:
@@ -254,7 +260,11 @@ def _spawn_auto_attach(usbipd: str, distro: str, bus_id: str) -> subprocess.Pope
 class AutoAttachManager:
     """Runs ``usbipd attach -a`` helpers per remembered device (with bind when needed)."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        firewall_fix_policy_provider: Callable[[], str] | None = None,
+    ) -> None:
         # ``start_mono`` is ``time.monotonic()`` when this listener was spawned.
         self._procs: dict[str, tuple[subprocess.Popen[Any], str, float]] = {}
         self._external_procs: dict[str, tuple[int, str, float]] = {}
@@ -262,10 +272,23 @@ class AutoAttachManager:
         self._last_adopt_scan_mono = 0.0
         self._attempt_no: dict[str, int] = {}
         self._failed: dict[str, str] = {}
+        self._firewall_fix_attempted: set[str] = set()
+        self._firewall_prompt_needed: dict[str, str] = {}
+        self._firewall_prompt_last_mono: dict[str, float] = {}
+        self._firewall_fix_policy_provider = firewall_fix_policy_provider
 
     def _reset_retry_state(self, instance_id: str) -> None:
         self._attempt_no.pop(instance_id, None)
         self._failed.pop(instance_id, None)
+        self._firewall_fix_attempted.discard(instance_id)
+        self._firewall_prompt_needed.pop(instance_id, None)
+        self._firewall_prompt_last_mono.pop(instance_id, None)
+
+    def consume_firewall_prompt_requests(self) -> list[tuple[str, str]]:
+        """Return and clear pending firewall-consent prompts from auto-attach failures."""
+        items = sorted(self._firewall_prompt_needed.items())
+        self._firewall_prompt_needed.clear()
+        return items
 
     def failed_instance_ids(self) -> set[str]:
         return set(self._failed.keys())
@@ -420,11 +443,60 @@ class AutoAttachManager:
         instance_id: str,
         bus_id: str,
     ) -> bool:
-        code, out, err = run_cmd(
-            usbipd,
-            ["attach", "--wsl", distro, "-b", bus_id],
-            timeout=_DIRECT_ATTACH_TIMEOUT_SEC,
-        )
+        def _run_attach() -> tuple[int, str, str]:
+            # Stream merged stdout/stderr so we can react as soon as usbipd emits
+            # firewall-signature text, instead of waiting until full timeout.
+            cancel_event = asyncio.Event()
+
+            def _chunk_looks_like_firewall_block(chunk: str) -> bool:
+                t = chunk.lower()
+                markers = (
+                    "timed out",
+                    "firewall",
+                    "3240",
+                    "group policy",
+                    "public network profile",
+                    "blocking the connection",
+                )
+                return any(m in t for m in markers)
+
+            def _on_text(chunk: str) -> None:
+                if cancel_event.is_set():
+                    return
+                if _chunk_looks_like_firewall_block(chunk):
+                    cancel_event.set()
+
+            try:
+                code, merged = asyncio.run(
+                    run_cmd_stream_merged_async(
+                        usbipd,
+                        ["attach", "--wsl", distro, "-b", bus_id],
+                        on_text=_on_text,
+                        timeout=_DIRECT_ATTACH_TIMEOUT_SEC,
+                        cancel_event=cancel_event,
+                    )
+                )
+            except Exception:
+                return run_cmd(
+                    usbipd,
+                    ["attach", "--wsl", distro, "-b", bus_id],
+                    timeout=_DIRECT_ATTACH_TIMEOUT_SEC,
+                )
+
+            text = (merged or "").strip()
+            if code == 0:
+                return 0, text, ""
+            if code == -2 and cancel_event.is_set():
+                # Early-cancelled because we already saw a firewall signature.
+                return 1, "", text or "Command timed out."
+            if code == -1:
+                if text:
+                    return 1, "", f"Command timed out.\n{text}"
+                return 1, "", "Command timed out."
+            return code, text, ""
+
+        code, out, err = _run_attach()
+        msg = err or out or "attach failed"
         if code == 0:
             _log.info(
                 "Direct attach fallback succeeded (instance_id=%s bus_id=%s)",
@@ -432,11 +504,89 @@ class AutoAttachManager:
                 bus_id,
             )
             return True
+        firewall_like = usbipd_output_suggests_firewall_block(msg)
+        if firewall_like:
+            policy = "ask"
+            if self._firewall_fix_policy_provider is not None:
+                try:
+                    policy = self._firewall_fix_policy_provider()
+                except Exception:  # pragma: no cover - defensive policy callback
+                    policy = "ask"
+            if policy == "never":
+                self._firewall_fix_attempted.add(instance_id)
+                _log.info(
+                    "Direct attach fallback appears blocked by firewall policy but saved "
+                    "setting forbids automatic changes (instance_id=%s bus_id=%s)",
+                    instance_id,
+                    bus_id,
+                )
+                return False
+            if policy != "always":
+                self._firewall_fix_attempted.add(instance_id)
+                now = time.monotonic()
+                last = self._firewall_prompt_last_mono.get(instance_id, 0.0)
+                if (
+                    instance_id not in self._firewall_prompt_needed
+                    and now - last >= _FIREWALL_PROMPT_REQUEUE_COOLDOWN_SEC
+                ):
+                    self._firewall_prompt_needed[instance_id] = msg
+                    self._firewall_prompt_last_mono[instance_id] = now
+                    _log.warning(
+                        "Direct attach fallback appears blocked by firewall policy; "
+                        "queued user-consent prompt (instance_id=%s bus_id=%s policy=%s)",
+                        instance_id,
+                        bus_id,
+                        policy,
+                    )
+                return False
+            if instance_id in self._firewall_fix_attempted:
+                _log.warning(
+                    "Direct attach fallback still shows firewall signature after prior "
+                    "auto-fix attempt (instance_id=%s bus_id=%s)",
+                    instance_id,
+                    bus_id,
+                )
+                return False
+            self._firewall_fix_attempted.add(instance_id)
+            _log.warning(
+                "Direct attach fallback looks blocked by firewall policy; "
+                "attempting automatic firewall fix (instance_id=%s bus_id=%s): %s",
+                instance_id,
+                bus_id,
+                (msg[:597] + "...") if len(msg) > 600 else msg,
+            )
+            fix_ok, fix_err = apply_wsl_public_profile_firewall_fix()
+            if fix_ok:
+                code2, out2, err2 = _run_attach()
+                if code2 == 0:
+                    _log.info(
+                        "Direct attach fallback succeeded after firewall fix "
+                        "(instance_id=%s bus_id=%s)",
+                        instance_id,
+                        bus_id,
+                    )
+                    return True
+                msg = err2 or out2 or "attach failed"
+                _log.warning(
+                    "Direct attach still failing after automatic firewall fix "
+                    "(instance_id=%s bus_id=%s): %s",
+                    instance_id,
+                    bus_id,
+                    msg,
+                )
+            else:
+                _log.warning(
+                    "Automatic firewall fix failed during direct attach fallback "
+                    "(instance_id=%s bus_id=%s): %s",
+                    instance_id,
+                    bus_id,
+                    fix_err or "Set-NetFirewallProfile failed",
+                )
         _log.warning(
             "Direct attach fallback failed (instance_id=%s bus_id=%s): %s",
             instance_id,
             bus_id,
-            err or out or "attach failed",
+            msg,
         )
         return False
 
@@ -528,6 +678,8 @@ class AutoAttachManager:
                 now = time.monotonic()
                 attempt_no = self._attempt_no.get(instance_id, 1)
                 timeout_sec = _listener_timeout_for_attempt(attempt_no)
+                if instance_id not in self._firewall_fix_attempted:
+                    timeout_sec = min(timeout_sec, _INITIAL_LISTENER_TIMEOUT_SEC)
                 elapsed_sec = now - old_start
                 if elapsed_sec <= timeout_sec:
                     return
@@ -592,6 +744,8 @@ class AutoAttachManager:
                 now = time.monotonic()
                 attempt_no = self._attempt_no.get(instance_id, 1)
                 timeout_sec = _listener_timeout_for_attempt(attempt_no)
+                if instance_id not in self._firewall_fix_attempted:
+                    timeout_sec = min(timeout_sec, _INITIAL_LISTENER_TIMEOUT_SEC)
                 elapsed_sec = now - old_start
                 if elapsed_sec <= timeout_sec:
                     return

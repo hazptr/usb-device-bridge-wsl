@@ -18,6 +18,12 @@ from usbipd_attach_manager.process import run_cmd, run_cmd_async, run_executable
 
 _log = logging.getLogger(__name__)
 
+
+def _clip_log(text: str, *, limit: int = 600) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
 ATTACH_CMD_TIMEOUT_SEC = 50.0
 
 # Shorter than normal interactive timeouts so app exit cannot hang on stuck usbipd/WSL.
@@ -192,6 +198,10 @@ async def usbipd_attach_with_firewall_recovery(
     *,
     auto: bool,
     cancel_event: asyncio.Event | None = None,
+    firewall_fix_policy: str = "ask",
+    request_firewall_fix_consent: (
+        Callable[[str], Awaitable[tuple[bool, bool]]] | None
+    ) = None,
 ) -> tuple[bool, str]:
     ok, msg = await usbipd_attach_once(
         usbipd,
@@ -205,21 +215,82 @@ async def usbipd_attach_with_firewall_recovery(
         return True, ""
     if msg == "Cancelled." or (cancel_event and cancel_event.is_set()):
         return False, "Cancelled."
-    if not usbipd_output_suggests_firewall_block(msg):
+    firewall_like = usbipd_output_suggests_firewall_block(msg)
+    if not firewall_like:
         return False, msg
+    _log.warning(
+        "usbipd attach failed with firewall-like signature; trying auto-recovery "
+        "(distro=%s bus_id=%s auto=%s): %s",
+        distro,
+        bus_id,
+        auto,
+        _clip_log(msg),
+    )
+    policy = firewall_fix_policy if firewall_fix_policy in ("ask", "always", "never") else "ask"
+    if policy == "never":
+        _log.info(
+            "Firewall recovery skipped by saved policy (distro=%s bus_id=%s auto=%s)",
+            distro,
+            bus_id,
+            auto,
+        )
+        return (
+            False,
+            "usbipd attach appears blocked by firewall settings. "
+            "Automatic adjustment is disabled by your saved decision.",
+        )
+    if policy == "ask":
+        if request_firewall_fix_consent is None:
+            _log.info(
+                "Firewall recovery requires consent but no prompt callback was provided "
+                "(distro=%s bus_id=%s auto=%s)",
+                distro,
+                bus_id,
+                auto,
+            )
+            return (
+                False,
+                "usbipd attach appears blocked by firewall settings. "
+                "Please allow the firewall adjustment to continue.",
+            )
+        allow_now, _remember = await request_firewall_fix_consent(_clip_log(msg, limit=1200))
+        if not allow_now:
+            _log.info(
+                "User declined firewall recovery prompt (distro=%s bus_id=%s auto=%s)",
+                distro,
+                bus_id,
+                auto,
+            )
+            return False, "Attach cancelled: firewall adjustment was not approved."
     if cancel_event and cancel_event.is_set():
         return False, "Cancelled."
     fix_ok, fix_err = await apply_wsl_public_profile_firewall_fix_async()
     if cancel_event and cancel_event.is_set():
         return False, "Cancelled."
     if not fix_ok:
+        _log.warning(
+            "Automatic firewall recovery failed for attach "
+            "(distro=%s bus_id=%s auto=%s): %s",
+            distro,
+            bus_id,
+            auto,
+            _clip_log(fix_err),
+        )
         return (
             False,
             "usbipd attach failed, likely due to Windows Firewall / Public profile on "
             "the WSL vEthernet adapter.\n\n"
-            f"Automatic fix failed: {fix_err}\n\n"
+            f"Automatic TCP 3240 rule setup failed: {fix_err}\n\n"
+            "Please configure Windows Firewall manually and try again.\n\n"
             f"usbipd output:\n{msg}",
         )
+    _log.info(
+        "Automatic firewall recovery applied; retrying usbipd attach "
+        "(distro=%s bus_id=%s auto=%s)",
+        distro,
+        bus_id,
+        auto,
+    )
     ok2, msg2 = await usbipd_attach_once(
         usbipd,
         distro,
@@ -229,9 +300,24 @@ async def usbipd_attach_with_firewall_recovery(
         cancel_event=cancel_event,
     )
     if ok2:
+        _log.info(
+            "usbipd attach succeeded after automatic firewall recovery "
+            "(distro=%s bus_id=%s auto=%s)",
+            distro,
+            bus_id,
+            auto,
+        )
         return True, ""
     if msg2 == "Cancelled." or (cancel_event and cancel_event.is_set()):
         return False, "Cancelled."
+    _log.warning(
+        "usbipd attach still failing after automatic firewall recovery "
+        "(distro=%s bus_id=%s auto=%s): %s",
+        distro,
+        bus_id,
+        auto,
+        _clip_log(msg2),
+    )
     return (
         False,
         "Attach still failing after adjusting the Public firewall profile for WSL "
@@ -371,6 +457,10 @@ async def connect_to_wsl(
     *,
     auto_attach: bool,
     cancel_event: asyncio.Event | None = None,
+    firewall_fix_policy: str = "ask",
+    request_firewall_fix_consent: (
+        Callable[[str], Awaitable[tuple[bool, bool]]] | None
+    ) = None,
 ) -> tuple[bool, str]:
     bus_id = dev.get("BusId")
     if not bus_id:
@@ -385,5 +475,11 @@ async def connect_to_wsl(
         if cancel_event and cancel_event.is_set():
             return False, "Cancelled."
     return await usbipd_attach_with_firewall_recovery(
-        usbipd, distro, bus_id, auto=auto_attach, cancel_event=cancel_event
+        usbipd,
+        distro,
+        bus_id,
+        auto=auto_attach,
+        cancel_event=cancel_event,
+        firewall_fix_policy=firewall_fix_policy,
+        request_firewall_fix_consent=request_firewall_fix_consent,
     )

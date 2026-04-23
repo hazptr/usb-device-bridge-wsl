@@ -4,6 +4,7 @@ import atexit
 import ctypes
 import errno
 import logging
+import os
 import socket
 import subprocess
 import sys
@@ -50,6 +51,9 @@ _CONNECT_ATTEMPTS = 16
 _CONNECT_DELAY_S = 0.08
 _MUTEX_WAIT_AFTER_YIELD_S = 45.0
 _MUTEX_POLL_S = 0.15
+_FORCE_TAKEOVER_MUTEX_GRACE_S = 8.0
+_YIELD_WAIT_OPTIONAL_S = 6.0
+_YIELD_WAIT_REQUIRED_S = 12.0
 
 _kernel32 = None
 if sys.platform == "win32":
@@ -120,6 +124,22 @@ def release_singleton_mutex_before_uac_if_needed() -> None:
         return
     if _mutex_handle is not None:
         _close_mutex()
+
+
+def release_singleton_mutex_for_handoff() -> None:
+    """
+    Release singleton mutex immediately during same-app instance handoff.
+
+    Unlike the pre-UAC helper, this applies regardless of elevation state so
+    a newly-started replacement instance can acquire the mutex without waiting
+    for full shutdown of the yielding process.
+    """
+    if sys.platform != "win32" or not _kernel32:
+        return
+    if _mutex_handle is None:
+        return
+    logger.info("Releasing singleton mutex early for instance handoff.")
+    _close_mutex()
 
 
 def try_acquire_single_instance_mutex() -> bool:
@@ -286,6 +306,46 @@ def _windows_terminate_process(pid: int) -> bool:
         _kernel32.CloseHandle(h)
 
 
+def _windows_candidate_same_app_pids() -> list[int]:
+    """Best-effort process candidates for this app on Windows."""
+    exe_name = Path(sys.executable).name.lower()
+    wanted = {
+        exe_name,
+        "python.exe",
+        "pythonw.exe",
+        "usbipdwslattach.exe",
+    }
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=_WIN_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    found: set[int] = set()
+    for raw in (r.stdout or "").splitlines():
+        line = raw.strip().strip("\ufeff")
+        if not line:
+            continue
+        # CSV is simple here: "Image Name","PID",...
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        image = parts[0].lower()
+        if image not in wanted:
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        found.add(pid)
+    return sorted(found)
+
+
 def _ipc_probe_hello_once(
     my_version: str, *, connect_s: float, io_s: float
 ) -> str:
@@ -433,6 +493,9 @@ def _handle_client_connection(conn: socket.socket) -> None:
                         client_ver,
                         mine,
                     )
+                # Release mutex as early as possible in the handshake path so the
+                # incoming instance can proceed without waiting for UI teardown.
+                release_singleton_mutex_for_handoff()
                 _send_line(conn, "YIELD")
                 conn.close()
                 _schedule_yield()
@@ -503,9 +566,54 @@ def start_focus_server() -> None:
     _server_thread.start()
 
 
-def _wait_then_acquire_mutex() -> bool:
+def _wait_then_acquire_mutex(*, timeout_s: float) -> bool:
     """After the running instance exits, take the singleton mutex."""
-    deadline = time.monotonic() + _MUTEX_WAIT_AFTER_YIELD_S
+    deadline = time.monotonic() + max(0.5, timeout_s)
+    while time.monotonic() < deadline:
+        if try_acquire_single_instance_mutex():
+            return True
+        time.sleep(_MUTEX_POLL_S)
+    return False
+
+
+def _force_takeover_after_yield_timeout() -> bool:
+    """
+    Last-resort takeover path after a peer replied YIELD but never released mutex.
+
+    Terminates same-app process(es) still listening on the IPC port, then retries
+    acquiring the singleton mutex for a short grace period.
+    """
+    if sys.platform != "win32" or not _kernel32:
+        return False
+    listen_pids = _windows_listen_pids_for_port(FOCUS_PORT)
+    ours = [p for p in listen_pids if _pid_appears_to_be_this_app(p)]
+    # If the old process stopped accepting IPC but still holds the mutex, it may no
+    # longer appear as a listener. Probe same-app process candidates as fallback.
+    if not ours:
+        for pid in _windows_candidate_same_app_pids():
+            if pid == os.getpid():
+                continue
+            if _pid_appears_to_be_this_app(pid):
+                ours.append(pid)
+    ours = sorted(set(ours))
+    if not ours:
+        return False
+
+    terminated = False
+    for pid in ours:
+        if pid == os.getpid():
+            continue
+        if _windows_terminate_process(pid):
+            terminated = True
+            logger.warning(
+                "Forced takeover: terminated stale single-instance peer (pid=%s).",
+                pid,
+            )
+
+    if not terminated:
+        return False
+
+    deadline = time.monotonic() + _FORCE_TAKEOVER_MUTEX_GRACE_S
     while time.monotonic() < deadline:
         if try_acquire_single_instance_mutex():
             return True
@@ -563,13 +671,23 @@ def _tcp_handshake(my_version: str, *, allow_missing_peer: bool) -> bool:
                     logger.info(
                         "Waiting for the previous instance to exit so this version can run."
                     )
-                    if _wait_then_acquire_mutex():
+                    wait_budget_s = (
+                        _YIELD_WAIT_OPTIONAL_S
+                        if allow_missing_peer
+                        else _YIELD_WAIT_REQUIRED_S
+                    )
+                    if _wait_then_acquire_mutex(timeout_s=wait_budget_s):
                         return True
                     logger.error(
                         "Timed out waiting for the previous instance to release the singleton "
                         "lock (waited %ss). If it is stuck, end the process in Task Manager.",
-                        int(_MUTEX_WAIT_AFTER_YIELD_S),
+                        int(wait_budget_s),
                     )
+                    if _force_takeover_after_yield_timeout():
+                        logger.warning(
+                            "Forced takeover succeeded after yield timeout; continuing startup."
+                        )
+                        return True
                     return False
                 if line == "FOCUS":
                     logger.info(

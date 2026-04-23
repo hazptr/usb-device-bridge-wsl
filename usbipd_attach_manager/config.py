@@ -5,6 +5,15 @@ import os
 from pathlib import Path
 from typing import Any
 
+FIREWALL_FIX_POLICY_ASK = "ask"
+FIREWALL_FIX_POLICY_ALWAYS = "always"
+FIREWALL_FIX_POLICY_NEVER = "never"
+_FIREWALL_FIX_POLICY_VALUES = {
+    FIREWALL_FIX_POLICY_ASK,
+    FIREWALL_FIX_POLICY_ALWAYS,
+    FIREWALL_FIX_POLICY_NEVER,
+}
+
 
 def app_data_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
@@ -26,6 +35,7 @@ def default_config() -> dict[str, Any]:
         "sort_order": "state_attached_first",
         "device_recency": {},
         "minimize_to_tray": False,
+        "firewall_fix_policy": FIREWALL_FIX_POLICY_ASK,
     }
 
 
@@ -105,11 +115,15 @@ def load_config() -> dict[str, Any]:
         data.setdefault("sort_order", "state_attached_first")
         data.setdefault("device_recency", {})
         data.setdefault("minimize_to_tray", False)
+        data.setdefault("firewall_fix_policy", FIREWALL_FIX_POLICY_ASK)
         _migrate_legacy_devices(data)
         if not isinstance(data["devices"], dict):
             data["devices"] = {}
         if not isinstance(data["device_recency"], dict):
             data["device_recency"] = {}
+        policy = data.get("firewall_fix_policy")
+        if policy not in _FIREWALL_FIX_POLICY_VALUES:
+            data["firewall_fix_policy"] = FIREWALL_FIX_POLICY_ASK
         return data
     except (OSError, json.JSONDecodeError):
         return default_config()

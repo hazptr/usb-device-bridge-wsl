@@ -15,13 +15,20 @@ import flet as ft
 from usbipd_attach_manager.app_logging import install_asyncio_exception_logging
 from usbipd_attach_manager.auto_attach import AutoAttachManager
 from usbipd_attach_manager.config import (
+    FIREWALL_FIX_POLICY_ALWAYS,
+    FIREWALL_FIX_POLICY_ASK,
+    FIREWALL_FIX_POLICY_NEVER,
     load_config,
     prune_device_entry_if_unused,
     remembered_instance_ids,
     save_config,
 )
 from usbipd_attach_manager.firewall import apply_wsl_public_profile_firewall_fix_async
-from usbipd_attach_manager.single_instance import set_focus_handler, set_yield_handler
+from usbipd_attach_manager.single_instance import (
+    release_singleton_mutex_for_handoff,
+    set_focus_handler,
+    set_yield_handler,
+)
 from usbipd_attach_manager.system_package_install import (
     find_winget,
     powershell_stream_setup_dialog_test,
@@ -295,7 +302,11 @@ async def run_app(page: ft.Page) -> None:
     seen_auto_failures: set[str] = set()
     poll_stop = asyncio.Event()
     install_cancel_holder: list[asyncio.Event | None] = [None]
-    auto_attach_manager = AutoAttachManager()
+    auto_attach_manager = AutoAttachManager(
+        firewall_fix_policy_provider=lambda: (
+            cfg.get("firewall_fix_policy") or FIREWALL_FIX_POLICY_ASK
+        )
+    )
     preserve_auto_attach_on_exit = [False]
 
     def _auto_attach_atexit_cleanup() -> None:
@@ -364,6 +375,7 @@ async def run_app(page: ft.Page) -> None:
         logging.getLogger(__name__).info(
             "A newer version was started; exiting so it can take over."
         )
+        release_singleton_mutex_for_handoff()
         await full_shutdown(yield_to_replacement=True)
 
     async def hide_to_tray() -> None:
@@ -407,6 +419,161 @@ async def run_app(page: ft.Page) -> None:
         )
         page.snack_bar.open = True
         page.update()
+
+    _firewall_prompt_lock = asyncio.Lock()
+
+    def _firewall_fix_policy() -> str:
+        raw = (cfg.get("firewall_fix_policy") or FIREWALL_FIX_POLICY_ASK).strip().lower()
+        if raw in (
+            FIREWALL_FIX_POLICY_ASK,
+            FIREWALL_FIX_POLICY_ALWAYS,
+            FIREWALL_FIX_POLICY_NEVER,
+        ):
+            return raw
+        return FIREWALL_FIX_POLICY_ASK
+
+    def _set_firewall_fix_policy(policy: str) -> None:
+        cfg["firewall_fix_policy"] = policy
+        save_config(cfg)
+
+    async def ask_firewall_fix_consent(
+        *,
+        reason_text: str,
+        title: str,
+        detail: str,
+    ) -> tuple[bool, bool]:
+        async with _firewall_prompt_lock:
+            policy = _firewall_fix_policy()
+            if policy == FIREWALL_FIX_POLICY_ALWAYS:
+                return True, False
+            if policy == FIREWALL_FIX_POLICY_NEVER:
+                return False, False
+
+            completed: asyncio.Future[tuple[bool, bool]] = asyncio.get_running_loop().create_future()
+            remember_cb = ft.Checkbox(
+                label="Remember my decision",
+                value=False,
+                active_color=ACCENT,
+            )
+            clipped_reason = reason_text[:1200] + ("..." if len(reason_text) > 1200 else "")
+
+            def _finish(allow: bool) -> None:
+                if completed.done():
+                    return
+                completed.set_result((allow, bool(remember_cb.value)))
+                dlg.open = False
+                page.update()
+
+            def _on_dismiss(_: ft.ControlEvent) -> None:
+                _finish(False)
+
+            # Auto-attach prompts can fire while the window is hidden to tray.
+            # Bring the app to foreground so the consent dialog is actually visible.
+            try:
+                page.window.minimized = False
+                page.window.visible = True
+                page.window.skip_task_bar = False
+                await page.window.to_front()
+            except Exception:  # pragma: no cover - UI capability varies by host
+                pass
+
+            dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Text(title, color="#f8fafc"),
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            detail,
+                            color="#cbd5e1",
+                            size=12,
+                        ),
+                        ft.Container(height=4),
+                        ft.Text(
+                            "usbipd output:",
+                            color="#94a3b8",
+                            size=11,
+                        ),
+                        ft.Text(
+                            clipped_reason or "(no details)",
+                            color="#e2e8f0",
+                            size=11,
+                            selectable=True,
+                        ),
+                        ft.Container(height=8),
+                        remember_cb,
+                    ],
+                    spacing=6,
+                    tight=True,
+                ),
+                actions=[
+                    ft.TextButton("Not now", on_click=lambda _: _finish(False)),
+                    ft.FilledButton("Allow", on_click=lambda _: _finish(True)),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+                on_dismiss=_on_dismiss,
+            )
+            page.show_dialog(dlg)
+            page.update()
+            return await completed
+
+    async def handle_auto_attach_firewall_prompts(devs: list[dict[str, Any]]) -> None:
+        pending = auto_attach_manager.consume_firewall_prompt_requests()
+        if not pending:
+            return
+        logging.getLogger(__name__).warning(
+            "Auto-attach firewall consent prompts pending: count=%s instance_ids=%s",
+            len(pending),
+            [inst for inst, _msg in pending],
+        )
+        by_inst = {
+            d.get("InstanceId") or "": d
+            for d in devs
+            if d.get("InstanceId")
+        }
+        for inst, reason in pending:
+            dev = by_inst.get(inst) or {}
+            desc = dev.get("Description") or "remembered device"
+            bus_id = dev.get("BusId") or "unknown"
+            logging.getLogger(__name__).warning(
+                "Showing firewall consent prompt for auto-attach "
+                "(instance_id=%s bus_id=%s desc=%s)",
+                inst,
+                bus_id,
+                desc,
+            )
+            allow, remember = await ask_firewall_fix_consent(
+                reason_text=reason,
+                title="Firewall Is Blocking USB Attach",
+                detail=(
+                    f"{desc} (Bus {bus_id}) could not attach to WSL because Windows "
+                    "firewall settings appear to block usbipd communication.\n\n"
+                    "Allow this app to adjust the Public firewall profile for WSL "
+                    "vEthernet interfaces now?"
+                ),
+            )
+            if remember:
+                _set_firewall_fix_policy(
+                    FIREWALL_FIX_POLICY_ALWAYS if allow else FIREWALL_FIX_POLICY_NEVER
+                )
+            logging.getLogger(__name__).warning(
+                "Firewall consent prompt decision for auto-attach "
+                "(instance_id=%s allow=%s remember=%s)",
+                inst,
+                allow,
+                remember,
+            )
+            if not allow:
+                continue
+            fix_ok, fix_err = await apply_wsl_public_profile_firewall_fix_async()
+            if not fix_ok:
+                show_error(
+                    "Could not apply the TCP 3240 firewall rule for WSL vEthernet.\n\n"
+                    "Please configure Windows Firewall manually, then try again.\n\n"
+                    f"Detail: {fix_err}"
+                )
+                continue
+            auto_attach_manager.retry_background_attach(inst)
+            show_ok("Firewall updated. Retrying remembered-device attach.")
 
     async def refresh_distros() -> None:
         names = await asyncio.to_thread(parse_wsl_distros)
@@ -460,6 +627,7 @@ async def run_app(page: ft.Page) -> None:
             devs,
             distro_for_instance,
         )
+        await handle_auto_attach_firewall_prompts(devs)
 
         status_text.value = f"{len(devs)} device(s) — usbipd at {usbipd_exe}"
         remembered = remembered_instance_ids(cfg)
@@ -533,12 +701,35 @@ async def run_app(page: ft.Page) -> None:
                     )
                     return
                 persist_cfg()
+
+                async def _request_firewall_fix_for_manual_attach(
+                    reason_text: str,
+                ) -> tuple[bool, bool]:
+                    allow, remember = await ask_firewall_fix_consent(
+                        reason_text=reason_text,
+                        title="Firewall Is Blocking USB Attach",
+                        detail=(
+                            "Device attachment to WSL appears blocked by Windows firewall "
+                            "settings for the WSL vEthernet interface.\n\n"
+                            "Allow this app to adjust that firewall setting now?"
+                        ),
+                    )
+                    if remember:
+                        _set_firewall_fix_policy(
+                            FIREWALL_FIX_POLICY_ALWAYS
+                            if allow
+                            else FIREWALL_FIX_POLICY_NEVER
+                        )
+                    return allow, remember
+
                 ok, msg = await connect_to_wsl(
                     usbipd_exe,
                     d,
                     dev,
                     auto_attach=False,
                     cancel_event=cancel_ev,
+                    firewall_fix_policy=_firewall_fix_policy(),
+                    request_firewall_fix_consent=_request_firewall_fix_for_manual_attach,
                 )
                 if ok:
                     touch_device(cfg, dev.get("InstanceId") or "")
@@ -575,6 +766,9 @@ async def run_app(page: ft.Page) -> None:
             auto_failed_ids=auto_failed_ids,
             auto_long_wait_ids=auto_long_wait_ids,
         )
+        # A manual refresh can overlap poll-triggered rebuild; clear again at render
+        # time so interleaved runs do not append duplicate rows.
+        device_list.controls.clear()
         for dev in sort_devices_list(devs, order, cfg.get("device_recency") or {}):
             desc = dev.get("Description") or "(no description)"
             bus = dev.get("BusId") or "—"
@@ -1292,6 +1486,7 @@ async def run_app(page: ft.Page) -> None:
                     devs,
                     distro_for_instance,
                 )
+                await handle_auto_attach_firewall_prompts(devs)
 
             # List UI: refresh on a timer when auto-refresh is on, or whenever there
             # are remembered devices (AGENTS.md — discovery without manual refresh).
@@ -1667,20 +1862,11 @@ async def run_app(page: ft.Page) -> None:
         )
     loading_overlay.visible = True
     page.update()
-    fw_ok = True
-    fw_err = ""
     try:
-        fw_ok, fw_err = await apply_wsl_public_profile_firewall_fix_async()
         await rebuild_devices()
     finally:
         loading_overlay.visible = False
         page.update()
-    if not fw_ok:
-        show_error(
-            "Could not adjust the Public firewall profile for WSL vEthernet adapters. "
-            "usbipd attach may hang or warn about port 3240 until this is fixed.\n\n"
-            f"Detail: {fw_err}"
-        )
 
     if (
         cfg.get("apply_on_startup")
