@@ -1,24 +1,59 @@
-# USB/IP to WSL Attach Manager
+# USB Device Bridge for WSL
 
-Windows desktop app that lists USB devices (via [usbipd-win](https://github.com/dorssel/usbipd-win)), lets you attach them to a WSL2 distribution, and optionally **remembers** devices so the app keeps working toward attachment while it runs.
+<div align="center">
+  <img src="assets/app_icon_source.png" alt="USB Device Bridge for WSL Logo" width="200" />
+</div>
 
-- **Product behavior and release intent:** see [AGENTS.md](AGENTS.md)  
-- **Prerequisites:** Windows, WSL2, Python 3.10+, and usbipd-win installed; administrator rights for bind/attach.
+**Easily attach USB devices to Windows Subsystem for Linux (WSL2) with automatic reconnection support.**
 
-## Run from source
+A Windows desktop application that simplifies USB device sharing between Windows and Linux in WSL2. Quickly list, attach, and manage USB peripherals in your Linux environment with one-click operations and automatic device reconnection when devices are plugged in.
 
-```text
+## Features
+
+- **Simple USB Management:** Browse all USB devices connected to your Windows PC in an intuitive interface
+- **Automatic Reconnection:** Mark devices to remember them—USB Device Bridge automatically reattaches them to WSL2 when plugged in while the app is running
+- **Per-Device Configuration:** Assign each USB device to a specific WSL distribution
+- **GUI Simplicity:** No command-line required—full GUI for device discovery and attachment
+- **Persistent Settings:** Your device preferences survive app restarts
+
+## Requirements
+
+- **Windows 10/11** with Administrator rights
+- **WSL2** installed and configured
+- **[usbipd-win](https://github.com/dorssel/usbipd-win)** (the app guides you to install it if missing)
+- **Python 3.10+** (for running from source)
+
+## Quick Start
+
+### Windows Installer
+
+Download the latest installer from [releases](https://github.com/delabrcd/usbip-attach-manager/releases). Run the `.exe` file and follow the setup wizard. The app will prompt you to install any missing prerequisites.
+
+### Run from Source
+
+```bash
 py -m pip install -r requirements.txt
 py main.py
 ```
 
-Editable install: `py -m pip install -e .` then `usbipd-attach-ui`.
+For development with editable install:
+```bash
+py -m pip install -e .
+usb-device-bridge
+```
 
-## Windows installer
+## Build Windows Installer Locally
 
-Locally: install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then from the repo root run `.\scripts\build_installer.ps1` (Produced output is under `dist-installer\`, and is not committed to git.)
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then run:
+```bash
+.\scripts\build_installer.ps1
+```
+Output appears in `dist-installer\`
 
-A GitHub Action builds the same installer and uploads it on pushes and as a [release](https://github.com/delabrcd/usbip-attach-manager/releases) asset when a release is published.
+## Development
+
+- **Product specification:** see [AGENTS.md](AGENTS.md) for functional requirements and architecture
+- **Contribution guide:** same document includes code organization guidelines
 
 ## License
 

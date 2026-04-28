@@ -31,11 +31,15 @@ def default_config() -> dict[str, Any]:
         "wsl_distro": "",
         "devices": {},
         "apply_on_startup": False,
+        "auto_update": True,
         "auto_refresh": True,
         "sort_order": "state_attached_first",
         "device_recency": {},
         "minimize_to_tray": False,
         "firewall_fix_policy": FIREWALL_FIX_POLICY_ASK,
+        "theme": "dark",
+        "theme_first_run_shown": False,
+        "startup_first_run_shown": False,
     }
 
 
@@ -111,11 +115,18 @@ def load_config() -> dict[str, Any]:
         data = json.loads(p.read_text(encoding="utf-8"))
         data.setdefault("wsl_distro", "")
         data.setdefault("apply_on_startup", False)
+        data.setdefault("auto_update", True)
         data.setdefault("auto_refresh", True)
         data.setdefault("sort_order", "state_attached_first")
         data.setdefault("device_recency", {})
         data.setdefault("minimize_to_tray", False)
         data.setdefault("firewall_fix_policy", FIREWALL_FIX_POLICY_ASK)
+        data.setdefault("theme", "dark")
+        data.setdefault("theme_first_run_shown", False)
+        data.setdefault(
+            "startup_first_run_shown",
+            bool(data.get("theme_first_run_shown")),
+        )
         _migrate_legacy_devices(data)
         if not isinstance(data["devices"], dict):
             data["devices"] = {}

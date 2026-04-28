@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from usbipd_attach_manager.process import run_cmd
+from usb_device_bridge.process import run_cmd
 
 _log = logging.getLogger(__name__)
 

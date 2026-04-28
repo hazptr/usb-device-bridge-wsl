@@ -10,7 +10,7 @@
 
   Optional -ShutdownWsl terminates all WSL 2 VMs (wsl --shutdown). Use if Task Manager
   still shows stray "Windows Subsystem for Linux" after usbipd trees are gone — that
-  closes every WSL session, not only USB/IP.
+  closes every WSL session, not only USB devices through USB Device Bridge.
 
   If not already running elevated, the script prompts for Administrator (UAC) and
   re-launches itself with the same -Kill / -ShutdownWsl flags.

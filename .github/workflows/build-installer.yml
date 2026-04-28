@@ -60,14 +60,14 @@ jobs:
 
       - name: Compile and build installer
         run: |
-          python -m compileall usbipd_attach_manager
+          python -m compileall usb_device_bridge
           & "${{ github.workspace }}\scripts\build_installer.ps1"
         shell: pwsh
 
       - name: Upload setup EXE (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: UsbipdWslAttach-Setup
+          name: UsbDeviceBridge-Setup
           path: dist-installer/
           if-no-files-found: error
 
@@ -83,7 +83,7 @@ jobs:
       - name: Download installer
         uses: actions/download-artifact@v4
         with:
-          name: UsbipdWslAttach-Setup
+          name: UsbDeviceBridge-Setup
           path: dist-installer
 
       - name: Upload EXE to release
@@ -93,7 +93,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -e
-          for f in dist-installer/UsbipdWslAttach-Setup-*.exe; do
+          for f in dist-installer/UsbDeviceBridge-Setup-*.exe; do
             if [ -f "$f" ]; then
               gh release upload "${{ github.event.release.tag_name }}" "$f" --clobber
             else

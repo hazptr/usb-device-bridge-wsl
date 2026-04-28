@@ -50,7 +50,7 @@ Set-Content -LiteralPath $installerVerFile -Value $cleanVer -Encoding utf8 -NoNe
 Write-Host "Installer version: $cleanVer" -ForegroundColor Cyan
 
 Write-Host "PyInstaller (onedir) via $python..." -ForegroundColor Cyan
-& $python -m PyInstaller --noconfirm UsbipdWslAttach.spec
+& $python -m PyInstaller --noconfirm UsbDeviceBridge.spec
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $iscc = $null
@@ -70,11 +70,11 @@ if (-not $iscc) {
 
 if (-not $iscc) {
     Write-Error "Inno Setup 6 not found. Install from https://jrsoftware.org/isinfo.php " `
-        "or add ISCC.exe to PATH. Onedir build is in dist\UsbipdWslAttach\"
+        "or add ISCC.exe to PATH. Onedir build is in dist\UsbDeviceBridge\"
 }
 
 Write-Host "Inno Setup compiler: $iscc" -ForegroundColor Cyan
-& $iscc (Join-Path $repoRoot "packaging\UsbipdWslAttach.iss")
+& $iscc (Join-Path $repoRoot "packaging\UsbDeviceBridge.iss")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "Done. Output: dist-installer\UsbipdWslAttach-Setup-<version>.exe (see #define MyAppVersion in packaging\UsbipdWslAttach.iss)" -ForegroundColor Green
+Write-Host "Done. Output: dist-installer\UsbDeviceBridge-Setup-<version>.exe (see #define MyAppVersion in packaging\UsbDeviceBridge.iss)" -ForegroundColor Green

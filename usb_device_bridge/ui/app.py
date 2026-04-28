@@ -2,41 +2,65 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import json
 import logging
 import os
+import subprocess
 import sys
-import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import flet as ft
 
-from usbipd_attach_manager.app_logging import install_asyncio_exception_logging
-from usbipd_attach_manager.auto_attach import AutoAttachManager
-from usbipd_attach_manager.config import (
+from usb_device_bridge.app_logging import install_asyncio_exception_logging
+from usb_device_bridge.auto_attach import AutoAttachManager
+from usb_device_bridge.config import (
     FIREWALL_FIX_POLICY_ALWAYS,
     FIREWALL_FIX_POLICY_ASK,
     FIREWALL_FIX_POLICY_NEVER,
+    app_data_dir,
+    default_config,
     load_config,
     prune_device_entry_if_unused,
     remembered_instance_ids,
     save_config,
 )
-from usbipd_attach_manager.firewall import apply_wsl_public_profile_firewall_fix_async
-from usbipd_attach_manager.single_instance import (
+from usb_device_bridge.firewall import apply_wsl_public_profile_firewall_fix_async
+from usb_device_bridge.single_instance import (
     release_singleton_mutex_for_handoff,
     set_focus_handler,
     set_yield_handler,
 )
-from usbipd_attach_manager.system_package_install import (
-    find_winget,
-    powershell_stream_setup_dialog_test,
-    winget_install_usbipd,
-    wsl_install_usbip_client_packages,
+from usb_device_bridge.ui.helpers import (
+    assets_dir,
+    device_list_fingerprint,
+    test_first_time_setup_requested,
 )
-from usbipd_attach_manager.tray_manager import TrayManager
-from usbipd_attach_manager.usbipd import (
+from usb_device_bridge.ui.startup.shell import (
+    SetupShell,
+    SetupStepRegistration,
+)
+from usb_device_bridge.ui.startup.theme_prompt import (
+    build_theme_step_content,
+    calculate_theme_step_preferred_size,
+)
+from usb_device_bridge.ui.startup.usb_prompt import (
+    build_usb_step_content,
+    calculate_usb_step_preferred_size,
+    on_usb_step_leave,
+)
+from usb_device_bridge.ui.startup.preferences_prompt import (
+    build_preferences_step_content,
+    calculate_preferences_step_preferred_size,
+)
+from usb_device_bridge.ui.theme_picker import ThemeDropdownSelector
+from usb_device_bridge.ui.settings_panel import create_settings_panel
+from usb_device_bridge.ui.theme import AppTheme, ThemeManager
+from usb_device_bridge.ui.tray import TrayManager
+from usb_device_bridge.updater import (
+    check_for_available_update,
+    download_update_installer,
+)
+from usb_device_bridge.usbipd import (
     classify,
     connect_to_wsl,
     find_usbipd,
@@ -48,72 +72,30 @@ from usbipd_attach_manager.usbipd import (
     usbipd_disconnect_fully,
     vid_pid_from_instance,
 )
-from usbipd_attach_manager.version_info import get_display_version
-from usbipd_attach_manager.windows_startup import (
+from usb_device_bridge.version_info import (
+    get_app_version,
+    get_display_version,
+    is_dev_source_launch,
+)
+from usb_device_bridge.windows.startup import (
     can_configure_run_at_logon,
     is_run_at_logon_enabled,
     set_run_at_logon,
 )
-from usbipd_attach_manager.wsl import parse_wsl_distros
-
-ACCENT = "#2dd4bf"
-# Footer uses icon-only buttons below this width (half-screen on many monitors).
-FOOTER_COMPACT_BREAKPOINT_PX = 1150
+from usb_device_bridge.wsl import parse_wsl_distros
 
 _LOG_SETUP_INSTALL = logging.getLogger(__name__ + ".setup_install")
 
 
-def _test_setup_dialog_requested() -> bool:
-    if "--test-setup-dialog" in sys.argv:
-        return True
-    v = os.environ.get("USBIPD_ATTACH_MANAGER_TEST_SETUP_DIALOG", "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _device_list_fingerprint(
-    devs: list[dict[str, Any]],
-    order: str,
-    cfg: dict[str, Any],
-    *,
-    manual_attaching: set[str],
-    auto_attaching_ids: set[str],
-    auto_failed_ids: set[str],
-    auto_long_wait_ids: set[str],
-) -> str:
-    """Stable hash for whether the rendered device list would change."""
-    normalized = sorted(devs, key=lambda d: d.get("InstanceId") or "")
-    dev_prefs = sorted(
-        (k, sorted(ent.items()))
-        for k, ent in (cfg.get("devices") or {}).items()
-        if isinstance(ent, dict)
-    )
-    return json.dumps(
-        {
-            "d": normalized,
-            "o": order,
-            "r": cfg.get("device_recency") or {},
-            "dev": dev_prefs,
-            "m": sorted(manual_attaching),
-            "a": sorted(auto_attaching_ids),
-            "f": sorted(auto_failed_ids),
-            "l": sorted(auto_long_wait_ids),
-        },
-        sort_keys=True,
-        default=str,
-    )
-
-
-def _assets_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys._MEIPASS) / "assets"
-    return Path(__file__).resolve().parent.parent / "assets"
-
-
 async def run_app(page: ft.Page) -> None:
     install_asyncio_exception_logging()
-    _win_title = f"USB/IP → WSL — {get_display_version()}"
+    _display_version = get_display_version()
+    _is_dev_or_dirty_build = is_dev_source_launch() or (
+        "-dirty" in _display_version.lower()
+    )
+    _win_title = f"USB Device Bridge for WSL — {_display_version}"
     page.title = _win_title
-    ico = _assets_dir() / "app_icon.ico"
+    ico = assets_dir() / "app_icon.ico"
     if ico.is_file():
         page.window.icon = str(ico)
     page.window.width = 980
@@ -121,11 +103,23 @@ async def run_app(page: ft.Page) -> None:
     page.window.min_width = 720
     page.window.min_height = 520
     page.window.title_bar_hidden = True
-    page.theme_mode = ft.ThemeMode.DARK
     page.padding = 0
-    page.bgcolor = "#0b1220"
 
+    # Load config and initialize theme system
     cfg = load_config()
+    test_first_time_setup = test_first_time_setup_requested()
+    _saved_theme = cfg.get("theme", "dark")
+    theme_manager = ThemeManager(page, initial_theme=_saved_theme)
+    theme = theme_manager.current_theme
+
+    # Apply theme to page
+    page.theme_mode = (
+        ft.ThemeMode.DARK if theme.name == "dark" else ft.ThemeMode.LIGHT
+    )
+    page.bgcolor = theme.page_bg
+
+    ACCENT = theme.accent
+
     usbipd_exe = find_usbipd()
     wsl_distro_names: list[str] = []
 
@@ -140,57 +134,19 @@ async def run_app(page: ft.Page) -> None:
         value=cfg.get("auto_refresh", True),
         active_color=ACCENT,
     )
+    auto_update_sw = ft.Switch(
+        label="",
+        value=False if _is_dev_or_dirty_build else cfg.get("auto_update", True),
+        active_color=ACCENT,
+        disabled=_is_dev_or_dirty_build,
+    )
 
-    _txt_startup = ft.Text(
-        "Apply on startup",
-        size=10,
-        color="#cbd5e1",
-        text_align=ft.TextAlign.CENTER,
-    )
-    _txt_autorefresh = ft.Text(
-        "Auto-refresh (3s)",
-        size=10,
-        color="#cbd5e1",
-        text_align=ft.TextAlign.CENTER,
-        tooltip=(
-            "Refreshes the device list on a timer. If you have remembered devices, "
-            "the list still updates periodically so plug-ins are noticed; remembered "
-            "attachment runs in the background either way."
-        ),
-    )
-    col_remember_switch = ft.Column(
-        [_txt_startup, remember_startup],
-        spacing=3,
-        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        tight=True,
-    )
-    col_auto_switch = ft.Column(
-        [_txt_autorefresh, auto_refresh_sw],
-        spacing=3,
-        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        tight=True,
-    )
     minimize_to_tray_sw = ft.Switch(
         label="",
         value=cfg.get("minimize_to_tray", False),
         active_color=ACCENT,
     )
-    _txt_tray = ft.Text(
-        "To tray",
-        size=10,
-        color="#cbd5e1",
-        text_align=ft.TextAlign.CENTER,
-        tooltip=(
-            "Close or minimize sends the window to the notification area "
-            "(system tray). Open the tray icon to show the window or exit."
-        ),
-    )
-    col_tray_switch = ft.Column(
-        [_txt_tray, minimize_to_tray_sw],
-        spacing=3,
-        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        tight=True,
-    )
+
     _start_win_available = can_configure_run_at_logon()
     start_with_windows_sw = ft.Switch(
         label="",
@@ -198,34 +154,16 @@ async def run_app(page: ft.Page) -> None:
         active_color=ACCENT,
         disabled=not _start_win_available,
     )
-    _txt_start_win = ft.Text(
-        "Start with Windows",
-        size=10,
-        color="#cbd5e1",
-        text_align=ft.TextAlign.CENTER,
-        tooltip=(
-            "Adds this app to your per-user startup list so it runs when you sign in. "
-            "This is not a Windows background service. Turning it on does not require "
-            "administrator approval; you may still see one UAC prompt when the app "
-            "starts so usbipd can manage USB devices."
-        ),
-    )
-    col_start_win_switch = ft.Column(
-        [_txt_start_win, start_with_windows_sw],
-        spacing=3,
-        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        tight=True,
-        visible=_start_win_available,
-    )
+
     sort_dd = ft.Dropdown(
         label="Sort",
-        expand=True,
+        width=230,
         dense=True,
-        border_color="#334155",
+        border_color=theme.input_border,
         filled=True,
-        bgcolor="#1e293b",
-        label_style=ft.TextStyle(color="#94a3b8", size=12),
-        text_style=ft.TextStyle(color="#f1f5f9", size=13),
+        bgcolor=theme.input_bg,
+        label_style=ft.TextStyle(color=theme.input_label, size=12),
+        text_style=ft.TextStyle(color=theme.text_primary, size=13),
         options=[
             ft.DropdownOption(
                 key="state_attached_first", text="State · attached first"
@@ -240,18 +178,18 @@ async def run_app(page: ft.Page) -> None:
         value=cfg.get("sort_order", "state_attached_first"),
     )
 
-    status_text = ft.Text("", color="#94a3b8", size=11, expand=True)
+    status_text = ft.Text("", color=theme.text_muted, size=11, expand=True)
     title_heading = ft.Text(
         _win_title,
         size=13,
         weight=ft.FontWeight.W_600,
-        color="#f1f5f9",
+        color=theme.text_primary,
     )
     device_list = ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO, expand=True)
     loading_overlay = ft.Container(
         visible=True,
         expand=True,
-        bgcolor="#0b1220",
+        bgcolor=theme.page_bg,
         alignment=ft.Alignment.CENTER,
         content=ft.Column(
             [
@@ -259,7 +197,7 @@ async def run_app(page: ft.Page) -> None:
                 ft.Text(
                     "Loading devices…",
                     size=13,
-                    color="#94a3b8",
+                    color=theme.text_muted,
                 ),
             ],
             spacing=14,
@@ -270,12 +208,12 @@ async def run_app(page: ft.Page) -> None:
     shutdown_status_text = ft.Text(
         "Disconnecting devices…",
         size=13,
-        color="#94a3b8",
+        color=theme.text_muted,
     )
     shutdown_overlay = ft.Container(
         visible=False,
         expand=True,
-        bgcolor="#0b1220",
+        bgcolor=theme.page_bg,
         alignment=ft.Alignment.CENTER,
         content=ft.Column(
             [
@@ -302,6 +240,8 @@ async def run_app(page: ft.Page) -> None:
     seen_auto_failures: set[str] = set()
     poll_stop = asyncio.Event()
     install_cancel_holder: list[asyncio.Event | None] = [None]
+    auto_update_inflight = [False]
+    update_prompted_versions: set[str] = set()
     auto_attach_manager = AutoAttachManager(
         firewall_fix_policy_provider=lambda: (
             cfg.get("firewall_fix_policy") or FIREWALL_FIX_POLICY_ASK
@@ -378,6 +318,75 @@ async def run_app(page: ft.Page) -> None:
         release_singleton_mutex_for_handoff()
         await full_shutdown(yield_to_replacement=True)
 
+    async def prompt_update_ready(version: str, installer_path: Path) -> None:
+        if not version or version in update_prompted_versions:
+            return
+        update_prompted_versions.add(version)
+
+        completed: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+        def _finish(install_now: bool) -> None:
+            if completed.done():
+                return
+            completed.set_result(install_now)
+            dlg.open = False
+            page.update()
+
+        def _on_dismiss(_: ft.ControlEvent) -> None:
+            _finish(False)
+
+        try:
+            page.window.minimized = False
+            page.window.visible = True
+            page.window.skip_task_bar = False
+            await page.window.to_front()
+        except Exception:  # pragma: no cover - UI capability varies by host
+            pass
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Update Ready", color=theme.text_primary),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        f"Version {version} has finished downloading.",
+                        color=theme.text_secondary,
+                    ),
+                    ft.Text(
+                        "Install now? The app will close while the installer runs.",
+                        color=theme.text_muted,
+                        size=12,
+                    ),
+                    ft.Text(
+                        str(installer_path),
+                        color=theme.text_muted,
+                        size=11,
+                        selectable=True,
+                    ),
+                ],
+                spacing=6,
+                tight=True,
+            ),
+            actions=[
+                ft.TextButton("Later", on_click=lambda _: _finish(False)),
+                ft.FilledButton("Install update", on_click=lambda _: _finish(True)),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            on_dismiss=_on_dismiss,
+        )
+        page.show_dialog(dlg)
+        page.update()
+
+        install_now = await completed
+        if not install_now or _shutdown_started[0]:
+            return
+        try:
+            os.startfile(str(installer_path))
+        except OSError as ex:
+            show_error(f"Could not launch installer: {ex}")
+            return
+        await full_shutdown(yield_to_replacement=False)
+
     async def hide_to_tray() -> None:
         if not ico.is_file():
             show_error(
@@ -399,6 +408,7 @@ async def run_app(page: ft.Page) -> None:
 
     def persist_cfg() -> None:
         cfg["apply_on_startup"] = remember_startup.value
+        cfg["auto_update"] = auto_update_sw.value
         cfg["auto_refresh"] = auto_refresh_sw.value
         cfg["minimize_to_tray"] = minimize_to_tray_sw.value
         cfg["sort_order"] = sort_dd.value or "state_attached_first"
@@ -406,16 +416,16 @@ async def run_app(page: ft.Page) -> None:
 
     def show_error(msg: str) -> None:
         page.snack_bar = ft.SnackBar(
-            content=ft.Text(msg, color="#fecaca"),
-            bgcolor="#450a0a",
+            content=ft.Text(msg, color=theme.error),
+            bgcolor=theme.error_bg,
         )
         page.snack_bar.open = True
         page.update()
 
     def show_ok(msg: str) -> None:
         page.snack_bar = ft.SnackBar(
-            content=ft.Text(msg, color="#ecfdf5"),
-            bgcolor="#064e3b",
+            content=ft.Text(msg, color=theme.success),
+            bgcolor=theme.success_bg,
         )
         page.snack_bar.open = True
         page.update()
@@ -479,23 +489,23 @@ async def run_app(page: ft.Page) -> None:
 
             dlg = ft.AlertDialog(
                 modal=True,
-                title=ft.Text(title, color="#f8fafc"),
+                title=ft.Text(title, color=theme.text_primary),
                 content=ft.Column(
                     [
                         ft.Text(
                             detail,
-                            color="#cbd5e1",
+                            color=theme.text_secondary,
                             size=12,
                         ),
                         ft.Container(height=4),
                         ft.Text(
                             "usbipd output:",
-                            color="#94a3b8",
+                            color=theme.text_muted,
                             size=11,
                         ),
                         ft.Text(
                             clipped_reason or "(no details)",
-                            color="#e2e8f0",
+                            color=theme.text_secondary,
                             size=11,
                             selectable=True,
                         ),
@@ -628,19 +638,19 @@ async def run_app(page: ft.Page) -> None:
 
             dlg = ft.AlertDialog(
                 modal=True,
-                title=ft.Text("Auto-Attach Failed", color="#f8fafc"),
+                title=ft.Text("Auto-Attach Failed", color=theme.text_primary),
                 content=ft.Column(
                     [
                         ft.Text(
                             f"{description} (Bus {bus_id}) could not be attached "
                             f"to WSL after multiple attempts.",
-                            color="#cbd5e1",
+                            color=theme.text_secondary,
                             size=12,
                         ),
                         ft.Container(height=4),
                         ft.Text(
                             detail or "The device may not be responding correctly.",
-                            color="#94a3b8",
+                            color=theme.text_muted,
                             size=11,
                             selectable=True,
                         ),
@@ -648,7 +658,7 @@ async def run_app(page: ft.Page) -> None:
                         ft.Text(
                             "Would you like to remove it from your remembered "
                             "devices, or keep it and retry later?",
-                            color="#cbd5e1",
+                            color=theme.text_secondary,
                             size=12,
                         ),
                     ],
@@ -663,8 +673,8 @@ async def run_app(page: ft.Page) -> None:
                     ft.FilledButton(
                         "Remove",
                         on_click=lambda _: _finish(True),
-                        color="#fecaca",
-                        bgcolor="#7f1d1d",
+                        color=theme.error,
+                        bgcolor=theme.error_bg,
                     ),
                 ],
                 actions_alignment=ft.MainAxisAlignment.END,
@@ -698,7 +708,7 @@ async def run_app(page: ft.Page) -> None:
         if err:
             device_list.controls.append(
                 ft.Container(
-                    content=ft.Text(err, color="#fca5a5"),
+                    content=ft.Text(err, color=theme.error),
                     padding=16,
                 )
             )
@@ -841,7 +851,7 @@ async def run_app(page: ft.Page) -> None:
 
         order = cfg.get("sort_order") or sort_dd.value or "state_attached_first"
         auto_busy_ids = auto_attach_manager.instance_ids_attaching(devs, remembered)
-        last_list_fingerprint = _device_list_fingerprint(
+        last_list_fingerprint = device_list_fingerprint(
             devs,
             order,
             cfg,
@@ -860,16 +870,16 @@ async def run_app(page: ft.Page) -> None:
             st = classify(dev)
             if st == "attached":
                 st_label = "Attached"
-                st_color = "#34d399"
+                st_color = theme.pill_attached_text
             elif st == "shared":
                 st_label = "Shared"
-                st_color = "#fbbf24"
+                st_color = theme.pill_shared_text
             elif st == "available":
                 st_label = "Available"
-                st_color = "#94a3b8"
+                st_color = theme.pill_available_text
             else:
                 st_label = "Offline / persisted"
-                st_color = "#a78bfa"
+                st_color = theme.pill_offline_text
 
             vp = vid_pid_from_instance(inst) or "—"
             is_rem = inst in remembered
@@ -882,11 +892,11 @@ async def run_app(page: ft.Page) -> None:
             )
 
             pill_bg = {
-                "attached": "#14532d",
-                "shared": "#713f12",
-                "available": "#0f172a",
-                "offline": "#312e81",
-            }.get(st, "#1e293b")
+                "attached": theme.pill_attached_bg,
+                "shared": theme.pill_shared_bg,
+                "available": theme.pill_available_bg,
+                "offline": theme.pill_offline_bg,
+            }.get(st, theme.card_bg)
 
             dd_val = distro_for_instance(inst) if inst else None
             if (
@@ -899,11 +909,11 @@ async def run_app(page: ft.Page) -> None:
                 label="WSL",
                 width=148,
                 dense=True,
-                border_color="#334155",
+                border_color=theme.input_border,
                 filled=True,
-                bgcolor="#1e293b",
-                label_style=ft.TextStyle(color="#94a3b8", size=11),
-                text_style=ft.TextStyle(color="#f1f5f9", size=12),
+                bgcolor=theme.input_bg,
+                label_style=ft.TextStyle(color=theme.input_label, size=11),
+                text_style=ft.TextStyle(color=theme.text_primary, size=12),
                 options=[ft.dropdown.Option(n) for n in wsl_distro_names],
                 value=dd_val,
                 disabled=is_attaching or (not inst) or (not wsl_distro_names),
@@ -928,14 +938,14 @@ async def run_app(page: ft.Page) -> None:
                         desc,
                         size=13,
                         weight=ft.FontWeight.W_600,
-                        color="#f8fafc",
+                        color=theme.text_primary,
                         max_lines=1,
                         overflow=ft.TextOverflow.ELLIPSIS,
                     ),
                     ft.Text(
                         f"Bus {bus}  ·  {vp}",
                         size=11,
-                        color="#64748b",
+                        color=theme.text_muted,
                     ),
                 ],
                 spacing=2,
@@ -955,7 +965,7 @@ async def run_app(page: ft.Page) -> None:
                                         ft.ProgressBar(
                                             expand=True,
                                             color=ACCENT,
-                                            bgcolor="#1f2937",
+                                            bgcolor=theme.input_bg,
                                             bar_height=3,
                                             border_radius=2,
                                         ),
@@ -966,7 +976,7 @@ async def run_app(page: ft.Page) -> None:
                                                 else "Attaching…"
                                             ),
                                             size=10,
-                                            color="#fbbf24",
+                                            color=theme.warning,
                                             weight=ft.FontWeight.W_500,
                                             no_wrap=True,
                                         ),
@@ -974,7 +984,7 @@ async def run_app(page: ft.Page) -> None:
                                             "Retry",
                                             visible=is_auto_attaching and is_long_wait,
                                             style=ft.ButtonStyle(
-                                                color="#fbbf24",
+                                                color=theme.warning,
                                                 padding=ft.padding.symmetric(
                                                     horizontal=8,
                                                     vertical=2,
@@ -989,7 +999,7 @@ async def run_app(page: ft.Page) -> None:
                                             icon=ft.Icons.STOP_CIRCLE_OUTLINED,
                                             tooltip="Cancel attach",
                                             icon_size=22,
-                                            icon_color="#fb7185",
+                                            icon_color=theme.error,
                                             style=ft.ButtonStyle(padding=4),
                                             on_click=lambda e, i=inst: page.run_task(
                                                 cancel_attach_for_instance, i
@@ -1011,12 +1021,12 @@ async def run_app(page: ft.Page) -> None:
                                         ft.Icon(
                                             ft.Icons.ERROR_OUTLINE,
                                             size=16,
-                                            color="#fca5a5",
+                                            color=theme.error,
                                         ),
                                         ft.Text(
                                             "Auto-attach failed",
                                             size=10,
-                                            color="#fca5a5",
+                                            color=theme.error,
                                             weight=ft.FontWeight.W_500,
                                             no_wrap=True,
                                             tooltip=fail_msg,
@@ -1063,7 +1073,7 @@ async def run_app(page: ft.Page) -> None:
                         icon_size=18,
                         style=ft.ButtonStyle(
                             bgcolor=ACCENT,
-                            color="#0f172a",
+                            color=theme.text_on_accent,
                             padding=6,
                         ),
                         on_click=lambda e, d=dev: page.run_task(do_connect, d),
@@ -1092,7 +1102,7 @@ async def run_app(page: ft.Page) -> None:
                         ),
                         tooltip="Remember — keep attached to WSL while this app is open",
                         icon_size=20,
-                        icon_color=ACCENT if is_rem else "#64748b",
+                        icon_color=ACCENT if is_rem else theme.text_muted,
                         on_click=lambda e, i=inst, r=is_rem: page.run_task(
                             toggle_remember, i, not r
                         ),
@@ -1126,8 +1136,8 @@ async def run_app(page: ft.Page) -> None:
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
                 padding=ft.padding.symmetric(horizontal=10, vertical=6),
-                bgcolor="#111827",
-                border=ft.border.all(1, "#1f2937"),
+                bgcolor=theme.card_bg,
+                border=ft.border.all(1, theme.border_subtle),
                 border_radius=8,
             )
             device_list.controls.append(card)
@@ -1137,399 +1147,6 @@ async def run_app(page: ft.Page) -> None:
         loading_overlay.visible = False
         page.update()
 
-    async def present_usbip_setup_dialog(
-        *,
-        after_install_refresh: bool = True,
-        need_usbipd: bool | None = None,
-    ) -> None:
-        nonlocal usbipd_exe, initial_device_load_pending
-        completed: asyncio.Future[bool] = asyncio.Future()
-        setup_success_pending_review = [False]
-
-        if need_usbipd is None:
-            need_usbipd = not (
-                await asyncio.to_thread(usbipd_cli_works, usbipd_exe)
-            )
-        forced = _test_setup_dialog_requested()
-
-        if need_usbipd:
-            intro_parts: list[ft.Control] = [
-                ft.Text(
-                    "Installs usbipd-win on Windows with WinGet when needed, then installs "
-                    "USB packages in your selected WSL distro via apt (usbutils, "
-                    "linux-tools-generic, hwdata).",
-                    color="#e2e8f0",
-                ),
-            ]
-        else:
-            intro_parts = [
-                ft.Text(
-                    "Installs USB client packages in your selected WSL distro via apt "
-                    "(usbutils, linux-tools-generic, hwdata). usbipd-win is already "
-                    "installed on this PC.",
-                    color="#e2e8f0",
-                ),
-            ]
-        if forced and not need_usbipd:
-            intro_parts.insert(
-                0,
-                ft.Text(
-                    "Test mode: this dialog was forced; the WinGet install step is skipped "
-                    "because usbipd already works. A short streamed PowerShell run (including "
-                    "winget --version when available) exercises the same log path as WinGet.",
-                    color="#fbbf24",
-                ),
-            )
-        if not wsl_distro_names:
-            intro_parts.append(
-                ft.Text(
-                    "No WSL distributions were found. Install a distro (wsl --install) "
-                    "and restart this app, or continue to install only usbipd-win.",
-                    color="#fb923c",
-                ),
-            )
-        intro_col = ft.Column(intro_parts, spacing=8, tight=True)
-
-        status = ft.Text("", color="#94a3b8", selectable=True)
-
-        log_heading = ft.Text(
-            "WSL / apt output (live)",
-            color="#64748b",
-        )
-        stick_install_log = [True]
-        _log_append_depth = [0]
-
-        install_log_text = ft.Text(
-            "",
-            selectable=True,
-            font_family="monospace",
-            color="#e2e8f0",
-            size=12,
-            expand=True,
-        )
-
-        def on_install_log_scroll(e: ft.OnScrollEvent) -> None:
-            if _log_append_depth[0]:
-                return
-            try:
-                m = float(e.max_scroll_extent or 0)
-                p = float(e.pixels or 0)
-            except (TypeError, ValueError):
-                stick_install_log[0] = True
-                return
-            if m <= 1:
-                stick_install_log[0] = True
-            else:
-                stick_install_log[0] = p >= m - 36
-
-        log_scroll = ft.Column(
-            [install_log_text],
-            scroll=ft.ScrollMode.AUTO,
-            height=120,
-            tight=True,
-            spacing=0,
-            auto_scroll=False,
-            on_scroll=on_install_log_scroll,
-            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-        )
-
-        log_view = ft.Container(
-            content=log_scroll,
-            bgcolor="#0f172a",
-            border=ft.border.all(1, "#334155"),
-            border_radius=6,
-            padding=ft.padding.all(10),
-            expand=True,
-        )
-
-        async def _scroll_install_log_to_end() -> None:
-            try:
-                await log_scroll.scroll_to(offset=-1, duration=0)
-            except (OSError, RuntimeError, AttributeError):
-                pass
-
-        default_dist = (cfg.get("wsl_distro") or "").strip()
-        if default_dist not in wsl_distro_names:
-            default_dist = wsl_distro_names[0] if wsl_distro_names else None
-
-        distro_dd = ft.Dropdown(
-            label="WSL distro",
-            dense=True,
-            expand=True,
-            border_color="#334155",
-            filled=True,
-            bgcolor="#1e293b",
-            label_style=ft.TextStyle(color="#94a3b8"),
-            text_style=ft.TextStyle(color="#f1f5f9"),
-            options=[ft.dropdown.Option(n) for n in wsl_distro_names],
-            value=default_dist,
-            hint_text="No distributions" if not wsl_distro_names else None,
-            disabled=not wsl_distro_names,
-        )
-
-        skip_btn = ft.TextButton("Skip")
-
-        dlg: ft.AlertDialog | None = None
-
-        async def _apply_setup_success_chrome() -> None:
-            assert dlg is not None
-            dlg.shape = ft.RoundedRectangleBorder(
-                radius=12,
-                side=ft.BorderSide(3, "#22c55e"),
-            )
-            dlg.actions = [install_btn]
-            install_btn.content = "Continue"
-            install_btn.icon = ft.Icons.CHECK_CIRCLE
-            install_btn.disabled = False
-            install_btn.style = ft.ButtonStyle(
-                bgcolor=ACCENT,
-                color="#0f172a",
-                icon_color="#0f172a",
-                animation_duration=200,
-            )
-            page.update()
-            await asyncio.sleep(0.03)
-            install_btn.style = ft.ButtonStyle(
-                bgcolor={
-                    ft.ControlState.DEFAULT: "#16a34a",
-                    ft.ControlState.HOVERED: "#15803d",
-                },
-                color="#ffffff",
-                icon_color="#ffffff",
-                overlay_color="#14532d",
-                animation_duration=700,
-            )
-            page.update()
-
-        async def complete_setup_after_install() -> None:
-            if not completed.done():
-                completed.set_result(True)
-            page.pop_dialog()
-            page.update()
-            if not after_install_refresh:
-                return
-            loading_overlay.visible = True
-            page.update()
-            try:
-                await rebuild_devices()
-            finally:
-                loading_overlay.visible = False
-                page.update()
-
-        async def do_primary(_: ft.ControlEvent) -> None:
-            if setup_success_pending_review[0]:
-                await complete_setup_after_install()
-                return
-            nonlocal usbipd_exe
-            cancel_ev = asyncio.Event()
-            install_cancel_holder[0] = cancel_ev
-            try:
-                setup_success_pending_review[0] = False
-                install_btn.disabled = True
-                status.value = ""
-                status.color = "#94a3b8"
-                stick_install_log[0] = True
-                install_log_text.value = ""
-                page.update()
-                install_log: list[str] = [""]
-                last_log_ui = [0.0]
-
-                def _flush_install_log(*, force: bool = False) -> None:
-                    now = time.monotonic()
-                    if not force and now - last_log_ui[0] < 0.12:
-                        return
-                    last_log_ui[0] = now
-                    page.update()
-                    if stick_install_log[0]:
-                        page.run_task(_scroll_install_log_to_end)
-
-                def _append_install_log(delta: str) -> None:
-                    _log_append_depth[0] += 1
-                    try:
-                        if delta:
-                            _LOG_SETUP_INSTALL.info("%s", delta)
-                        install_log[0] += delta
-                        if len(install_log[0]) > 120000:
-                            install_log[0] = install_log[0][-100000:]
-                        install_log_text.value = install_log[0]
-                        _flush_install_log()
-                    finally:
-                        _log_append_depth[0] -= 1
-
-                install_log_text.value = ""
-                install_log[0] = ""
-                _LOG_SETUP_INSTALL.info("--- setup install output (stream follows) ---")
-
-                if need_usbipd:
-                    if not find_winget():
-                        status.value = (
-                            "WinGet was not found. Install App Installer from the "
-                            "Microsoft Store, then retry."
-                        )
-                        install_btn.disabled = False
-                        skip_btn.disabled = False
-                        page.update()
-                        return
-                    status.value = "Installing usbipd-win via WinGet (see log below)…"
-                    _append_install_log("— WinGet (usbipd-win) —\n")
-                    page.update()
-                    ok, msg = await winget_install_usbipd(
-                        on_output_text=_append_install_log,
-                        cancel_event=cancel_ev,
-                    )
-                    _flush_install_log(force=True)
-                    if not ok:
-                        status.value = (
-                            "Installation cancelled."
-                            if "[Cancelled.]" in msg
-                            else msg
-                        )
-                        install_btn.disabled = False
-                        skip_btn.disabled = False
-                        page.update()
-                        return
-                    usbipd_exe = find_usbipd()
-                    if not await asyncio.to_thread(usbipd_cli_works, usbipd_exe):
-                        status.value = (
-                            "usbipd still does not respond after install. Try restarting "
-                            "this app so PATH picks up the new install."
-                        )
-                        install_btn.disabled = False
-                        skip_btn.disabled = False
-                        page.update()
-                        return
-
-                if forced and not need_usbipd:
-                    status.value = (
-                        "Test mode: streaming PowerShell (incl. winget --version if available)…"
-                    )
-                    _append_install_log(
-                        "\n— Test: PowerShell stream (WinGet-style code path) —\n"
-                    )
-                    page.update()
-                    ok_ps, msg_ps = await powershell_stream_setup_dialog_test(
-                        on_output_text=_append_install_log,
-                        cancel_event=cancel_ev,
-                    )
-                    _flush_install_log(force=True)
-                    if not ok_ps:
-                        status.value = (
-                            "Installation cancelled."
-                            if "[Cancelled.]" in msg_ps
-                            else msg_ps
-                        )
-                        install_btn.disabled = False
-                        skip_btn.disabled = False
-                        page.update()
-                        return
-
-                d = (distro_dd.value or "").strip()
-                if not d:
-                    status.value = "Choose a WSL distro (or install WSL first)."
-                    install_btn.disabled = False
-                    skip_btn.disabled = False
-                    page.update()
-                    return
-
-                cfg["wsl_distro"] = d
-                save_config(cfg)
-
-                status.value = f"Installing packages in “{d}” (see log below)…"
-                _append_install_log("\n— WSL (apt) —\n")
-                page.update()
-
-                ok2, msg2 = await wsl_install_usbip_client_packages(
-                    d,
-                    on_output_text=_append_install_log,
-                    cancel_event=cancel_ev,
-                )
-                _flush_install_log(force=True)
-                if not ok2:
-                    if "[Cancelled.]" in msg2:
-                        status.value = "Installation cancelled."
-                    else:
-                        status.value = (
-                            "Installation failed — see output above. "
-                            f"{msg2[:400]}{'…' if len(msg2) > 400 else ''}"
-                        )
-                    install_btn.disabled = False
-                    skip_btn.disabled = False
-                    page.update()
-                    return
-
-                setup_success_pending_review[0] = True
-                status.value = (
-                    "Setup completed successfully. Review the log above, then tap Continue."
-                )
-                status.color = "#86efac"
-                await _apply_setup_success_chrome()
-            except Exception as ex:  # noqa: BLE001
-                status.value = str(ex)
-                install_btn.disabled = False
-                skip_btn.disabled = False
-                page.update()
-            finally:
-                install_cancel_holder[0] = None
-
-        async def do_skip(_: ft.ControlEvent) -> None:
-            ev = install_cancel_holder[0]
-            if ev is not None:
-                ev.set()
-                return
-            if setup_success_pending_review[0]:
-                await complete_setup_after_install()
-                return
-            if not completed.done():
-                completed.set_result(False)
-            page.pop_dialog()
-            page.update()
-
-        install_btn = ft.FilledButton(
-            content="Install",
-            icon=ft.Icons.DOWNLOAD,
-            on_click=lambda e: page.run_task(do_primary, e),
-            disabled=(not wsl_distro_names) and (not need_usbipd),
-        )
-        skip_btn.on_click = lambda e: page.run_task(do_skip, e)
-
-        def _on_dismiss(_: ft.ControlEvent) -> None:
-            if not completed.done():
-                completed.set_result(
-                    True if setup_success_pending_review[0] else False
-                )
-
-        dlg = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Set up USB/IP for WSL"),
-            content=ft.Container(
-                width=520,
-                padding=ft.padding.only(bottom=4),
-                content=ft.Column(
-                    [
-                        intro_col,
-                        distro_dd,
-                        status,
-                        log_heading,
-                        log_view,
-                    ],
-                    spacing=10,
-                    tight=True,
-                    scroll=ft.ScrollMode.HIDDEN,
-                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                ),
-            ),
-            actions=[skip_btn, install_btn],
-            actions_alignment=ft.MainAxisAlignment.END,
-            on_dismiss=_on_dismiss,
-        )
-
-        loading_overlay.visible = False
-        if initial_device_load_pending:
-            initial_device_load_pending = False
-        page.show_dialog(dlg)
-        page.update()
-        await asyncio.sleep(0)
-        await completed
 
     async def apply_remembered(*, quiet: bool = False) -> None:
         if not wsl_distro_names:
@@ -1552,6 +1169,54 @@ async def run_app(page: ft.Page) -> None:
                     "Remembered devices will attach when present — usually within a few "
                     "seconds of plug-in or state change."
                 )
+
+    async def run_auto_update_check(manual: bool = False) -> None:
+        if auto_update_inflight[0]:
+            if manual:
+                show_ok("Update check is already running.")
+            return
+        if (not manual) and (not auto_update_sw.value):
+            return
+        if _is_dev_or_dirty_build:
+            if manual:
+                show_ok("Update checks are disabled for dev/dirty builds.")
+            return
+        if not getattr(sys, "frozen", False):
+            if manual:
+                show_ok("Update checks are only available in installed app builds.")
+            return
+        if _shutdown_started[0]:
+            return
+
+        auto_update_inflight[0] = True
+        try:
+            current_version = get_app_version()
+            available = await asyncio.to_thread(
+                check_for_available_update,
+                current_version,
+            )
+            if available is None or _shutdown_started[0]:
+                if manual:
+                    show_ok("No updates available.")
+                return
+
+            downloaded = await asyncio.to_thread(
+                download_update_installer,
+                available,
+                target_dir=app_data_dir() / "updates",
+            )
+            if downloaded is None or _shutdown_started[0]:
+                if manual:
+                    show_error("Could not download the update installer.")
+                return
+
+            await prompt_update_ready(downloaded.version, downloaded.installer_path)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("Auto-update check failed")
+            if manual:
+                show_error("Update check failed. See app.log for details.")
+        finally:
+            auto_update_inflight[0] = False
 
     async def poll_loop() -> None:
         while not poll_stop.is_set():
@@ -1598,7 +1263,7 @@ async def run_app(page: ft.Page) -> None:
                 devs,
                 remember_ids,
             )
-            new_fp = _device_list_fingerprint(
+            new_fp = device_list_fingerprint(
                 devs,
                 order,
                 cfg,
@@ -1631,7 +1296,14 @@ async def run_app(page: ft.Page) -> None:
 
     sort_dd.on_change = on_sort_change
     remember_startup.on_change = lambda _: (persist_cfg())
-    auto_refresh_sw.on_change = lambda _: (persist_cfg())
+    auto_update_sw.on_change = lambda _: (persist_cfg(), page.run_task(run_auto_update_check))
+
+    def on_auto_refresh_change(_: ft.ControlEvent) -> None:
+        persist_cfg()
+        sync_header_action_buttons()
+        page.update()
+
+    auto_refresh_sw.on_change = on_auto_refresh_change
 
     def on_minimize_tray_change(_: ft.ControlEvent) -> None:
         persist_cfg()
@@ -1661,16 +1333,30 @@ async def run_app(page: ft.Page) -> None:
     start_with_windows_sw.on_change = on_start_with_windows_change
 
     _caption_style = ft.ButtonStyle(
-        color="#cbd5e1",
+        color=theme.text_secondary,
         bgcolor=ft.Colors.TRANSPARENT,
-        overlay_color="#334155",
+        overlay_color=theme.button_bg,
         padding=ft.padding.symmetric(horizontal=10, vertical=4),
     )
     _caption_close_style = ft.ButtonStyle(
-        color="#cbd5e1",
+        color=theme.text_secondary,
         bgcolor=ft.Colors.TRANSPARENT,
-        overlay_color="#7f1d1d",
+        overlay_color=theme.error_bg,
         padding=ft.padding.symmetric(horizontal=10, vertical=4),
+    )
+    _settings_caption_style_closed = ft.ButtonStyle(
+        color=theme.text_secondary,
+        bgcolor=ft.Colors.TRANSPARENT,
+        overlay_color=theme.button_bg,
+        padding=ft.padding.symmetric(horizontal=10, vertical=4),
+        animation_duration=220,
+    )
+    _settings_caption_style_open = ft.ButtonStyle(
+        color=theme.tab_active_text,
+        bgcolor=theme.tab_active_bg,
+        overlay_color=theme.accent_hover,
+        padding=ft.padding.symmetric(horizontal=10, vertical=4),
+        animation_duration=220,
     )
 
     maximize_btn = ft.IconButton(
@@ -1724,6 +1410,19 @@ async def run_app(page: ft.Page) -> None:
         style=_caption_close_style,
         on_click=lambda _: page.run_task(on_caption_close),
     )
+    refresh_header_btn = ft.IconButton(
+        icon=ft.Icons.REFRESH,
+        icon_size=18,
+        tooltip="Refresh device list",
+        style=_caption_style,
+        on_click=lambda _: page.run_task(rebuild_devices),
+    )
+    settings_header_btn = ft.IconButton(
+        icon=ft.Icons.SETTINGS,
+        icon_size=18,
+        tooltip="Show settings",
+        style=_settings_caption_style_closed,
+    )
 
     title_drag = ft.WindowDragArea(
         expand=True,
@@ -1748,7 +1447,7 @@ async def run_app(page: ft.Page) -> None:
         ),
     )
     caption_controls = ft.Row(
-        [minimize_btn, maximize_btn, close_btn],
+        [refresh_header_btn, settings_header_btn, minimize_btn, maximize_btn, close_btn],
         spacing=0,
         tight=True,
         vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1760,14 +1459,14 @@ async def run_app(page: ft.Page) -> None:
             expand=True,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         ),
-        bgcolor="#0f172a",
-        border=ft.border.only(bottom=ft.BorderSide(1, "#1e293b")),
+        bgcolor=theme.surface_bg,
+        border=ft.border.only(bottom=ft.BorderSide(1, theme.border_subtle)),
         padding=ft.padding.only(right=4),
     )
 
     list_padded = ft.Container(
         content=device_list_stack,
-        padding=ft.padding.symmetric(horizontal=8),
+        padding=ft.padding.only(left=8, right=8, top=8),
         expand=True,
     )
     body = ft.Container(
@@ -1779,77 +1478,203 @@ async def run_app(page: ft.Page) -> None:
             expand=True,
             spacing=4,
         ),
-        padding=ft.padding.only(bottom=8),
+        padding=ft.padding.only(bottom=0),
         expand=True,
     )
 
-    _refresh_style = ft.ButtonStyle(bgcolor="#334155", color="#f1f5f9")
-    _apply_style = ft.ButtonStyle(bgcolor="#0f766e", color="#ecfdf5")
-
     async def open_usbip_setup_from_footer() -> None:
         ok_host = await asyncio.to_thread(usbipd_cli_works, usbipd_exe)
-        await present_usbip_setup_dialog(
-            after_install_refresh=True,
-            need_usbipd=not ok_host,
+        ad_hoc_cancel: list[asyncio.Event | None] = [None]
+
+        def _update_usbipd_exe_ad_hoc(exe: str) -> None:
+            nonlocal usbipd_exe
+            usbipd_exe = exe
+
+        shell = SetupShell(page, theme, theme_manager, overlay_host=content_host)
+        await shell.run(
+            steps=[
+                SetupStepRegistration(
+                    key="usb_adhoc",
+                    should_show=lambda: True,
+                    initial_completed=lambda: False,
+                    size_resolver=lambda page_obj, _content: calculate_usb_step_preferred_size(
+                        page_obj,
+                        test_first_time_setup=False,
+                        need_usbipd=not ok_host,
+                        has_wsl_distros=bool(wsl_distro_names),
+                    ),
+                    build_content=lambda ctx: build_usb_step_content(
+                        ctx,
+                        page=page,
+                        cfg=cfg,
+                        wsl_distro_names=wsl_distro_names,
+                        test_first_time_setup=False,
+                        install_cancel_holder=ad_hoc_cancel,
+                        need_usbipd=not ok_host,
+                        on_usbipd_updated=_update_usbipd_exe_ad_hoc,
+                    ),
+                    on_leave=lambda direction: on_usb_step_leave(
+                        direction, install_cancel_holder=ad_hoc_cancel
+                    ),
+                ),
+            ],
+        )
+        await rebuild_devices()
+
+    def _build_relaunch_command() -> tuple[list[str], str | None]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable], None
+
+        entry = Path(sys.argv[0]).resolve() if sys.argv else None
+        if entry is not None and entry.is_file() and entry.suffix.lower() == ".py":
+            return [sys.executable, str(entry)], str(entry.parent)
+
+        return [sys.executable, "-m", "usb_device_bridge"], str(Path.cwd())
+
+    async def reset_preferences_and_relaunch() -> None:
+        if _shutdown_started[0]:
+            return
+
+        completed: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+        def _finish(confirm: bool) -> None:
+            if completed.done():
+                return
+            completed.set_result(confirm)
+            dlg.open = False
+            page.update()
+
+        def _on_dismiss(_: ft.ControlEvent) -> None:
+            _finish(False)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Reset Preferences", color=theme.text_primary),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Reset all saved preferences and relaunch the app?",
+                        color=theme.text_secondary,
+                    ),
+                    ft.Text(
+                        "This clears settings and device preferences, then starts "
+                        "first-time setup again.",
+                        color=theme.text_muted,
+                        size=12,
+                    ),
+                ],
+                spacing=6,
+                tight=True,
+            ),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _: _finish(False)),
+                ft.FilledButton("Reset & relaunch", on_click=lambda _: _finish(True)),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            on_dismiss=_on_dismiss,
         )
 
-    btn_install = ft.FilledButton(
-        content="Install",
-        icon=ft.Icons.DOWNLOAD,
-        tooltip="Install usbipd-win and/or WSL USB client packages (apt)",
-        style=_refresh_style,
-        on_click=lambda _: page.run_task(open_usbip_setup_from_footer),
-    )
-    btn_install_icon = ft.FilledIconButton(
-        icon=ft.Icons.DOWNLOAD,
-        tooltip="Install usbipd-win and/or WSL USB client packages (apt)",
-        style=_refresh_style,
-        icon_size=20,
-        on_click=lambda _: page.run_task(open_usbip_setup_from_footer),
-        visible=False,
-    )
-    btn_refresh = ft.FilledButton(
-        content="Refresh",
-        icon=ft.Icons.REFRESH,
-        tooltip="Refresh device list",
-        style=_refresh_style,
-        on_click=lambda _: page.run_task(rebuild_devices),
-    )
-    btn_refresh_icon = ft.FilledIconButton(
-        icon=ft.Icons.REFRESH,
-        tooltip="Refresh device list",
-        style=_refresh_style,
-        icon_size=20,
-        on_click=lambda _: page.run_task(rebuild_devices),
-        visible=False,
-    )
-    btn_apply = ft.FilledButton(
-        content="Apply remembered",
-        icon=ft.Icons.BOOKMARK_ADD,
-        tooltip="Connect all remembered devices",
-        style=_apply_style,
-        on_click=lambda _: page.run_task(apply_remembered),
-    )
-    btn_apply_icon = ft.FilledIconButton(
-        icon=ft.Icons.BOOKMARK_ADD,
-        tooltip="Connect all remembered devices",
-        style=_apply_style,
-        icon_size=20,
-        on_click=lambda _: page.run_task(apply_remembered),
-        visible=False,
-    )
-    def sync_footer_layout() -> None:
+        page.show_dialog(dlg)
+        page.update()
+        if not await completed:
+            return
+
+        if _start_win_available:
+            ok, err = set_run_at_logon(False)
+            if not ok:
+                show_error(err or "Could not reset Windows startup setting.")
+                return
+            _start_win_suppress[0] = True
+            start_with_windows_sw.value = False
+            _start_win_suppress[0] = False
+
+        cfg.clear()
+        cfg.update(default_config())
+        save_config(cfg)
+
         try:
-            w = float(page.window.width)
-        except (TypeError, ValueError):
-            w = 2000.0
-        compact = w < FOOTER_COMPACT_BREAKPOINT_PX
-        btn_install.visible = not compact
-        btn_install_icon.visible = compact
-        btn_refresh.visible = not compact
-        btn_refresh_icon.visible = compact
-        btn_apply.visible = not compact
-        btn_apply_icon.visible = compact
+            cmd, cwd = _build_relaunch_command()
+            release_singleton_mutex_for_handoff()
+            subprocess.Popen(cmd, cwd=cwd)
+        except OSError as ex:
+            show_error(f"Could not relaunch app: {ex}")
+            return
+
+        await full_shutdown(yield_to_replacement=True)
+
+    btn_install_usbipd = ft.OutlinedButton(
+        content="Install usbipd-win / WSL packages",
+        icon=ft.Icons.DOWNLOAD,
+        tooltip="Install usbipd-win and/or WSL USB client packages (apt)",
+        on_click=lambda _: page.run_task(open_usbip_setup_from_footer),
+    )
+    btn_check_updates_now = ft.OutlinedButton(
+        content="Check now",
+        icon=ft.Icons.SYSTEM_UPDATE_ALT,
+        tooltip="Check GitHub Releases for updates now",
+        on_click=lambda _: page.run_task(run_auto_update_check, True),
+        disabled=_is_dev_or_dirty_build,
+    )
+    btn_reset_preferences = ft.OutlinedButton(
+        content="Reset & relaunch",
+        icon=ft.Icons.RESTART_ALT,
+        tooltip="Clear all saved preferences and relaunch first-time setup",
+        on_click=lambda _: page.run_task(reset_preferences_and_relaunch),
+    )
+
+    # Create theme dropdown for settings panel
+    def _on_theme_change(theme_name: str) -> None:
+        cfg["theme"] = theme_name
+        persist_cfg()
+
+    theme_dropdown = ThemeDropdownSelector(
+        theme_manager=theme_manager,
+        on_change_callback=_on_theme_change,
+        initial_value=theme_manager.theme_name,
+    )
+
+    settings_panel = create_settings_panel(
+        page,
+        btn_install_usbipd=btn_install_usbipd,
+        btn_check_updates_now=btn_check_updates_now,
+        btn_reset_preferences=btn_reset_preferences,
+        auto_update_sw=auto_update_sw,
+        sort_dd=sort_dd,
+        remember_startup=remember_startup,
+        auto_refresh_sw=auto_refresh_sw,
+        minimize_to_tray_sw=minimize_to_tray_sw,
+        start_with_windows_sw=start_with_windows_sw,
+        start_win_available=_start_win_available,
+        settings_header_btn=settings_header_btn,
+        settings_caption_style_closed=_settings_caption_style_closed,
+        settings_caption_style_open=_settings_caption_style_open,
+        theme_dropdown=theme_dropdown,
+        theme=theme,
+    )
+
+    def _rebuild_settings_panel_for_theme(new_theme: AppTheme) -> None:
+        nonlocal settings_panel
+        settings_panel = create_settings_panel(
+            page,
+            btn_install_usbipd=btn_install_usbipd,
+            btn_check_updates_now=btn_check_updates_now,
+            btn_reset_preferences=btn_reset_preferences,
+            auto_update_sw=auto_update_sw,
+            sort_dd=sort_dd,
+            remember_startup=remember_startup,
+            auto_refresh_sw=auto_refresh_sw,
+            minimize_to_tray_sw=minimize_to_tray_sw,
+            start_with_windows_sw=start_with_windows_sw,
+            start_win_available=_start_win_available,
+            settings_header_btn=settings_header_btn,
+            settings_caption_style_closed=_settings_caption_style_closed,
+            settings_caption_style_open=_settings_caption_style_open,
+            theme_dropdown=theme_dropdown,
+            theme=new_theme,
+        )
+
+    def sync_header_action_buttons() -> None:
+        refresh_header_btn.visible = not bool(auto_refresh_sw.value)
 
     def on_window_event(e: ft.WindowEvent) -> None:
         t = e.type
@@ -1864,7 +1689,6 @@ async def run_app(page: ft.Page) -> None:
                 page.run_task(hide_to_tray)
             return
         if t == ft.WindowEventType.RESIZED or t == "resized":
-            sync_footer_layout()
             sync_caption_icons()
             page.update()
             return
@@ -1878,72 +1702,159 @@ async def run_app(page: ft.Page) -> None:
             page.update()
             return
 
-    footer_actions = ft.Row(
+    content_host = ft.Stack(
         [
-            btn_install,
-            btn_install_icon,
-            btn_refresh,
-            btn_refresh_icon,
-            btn_apply,
-            btn_apply_icon,
-            col_remember_switch,
-            col_auto_switch,
-            col_tray_switch,
-            col_start_win_switch,
+            list_padded,
+            settings_panel.overlay,
         ],
-        spacing=8,
-        tight=True,
-        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-    )
-
-    footer_row = ft.Row(
-        [
-            sort_dd,
-            footer_actions,
-        ],
-        spacing=8,
-        wrap=False,
-        tight=False,
-        vertical_alignment=ft.CrossAxisAlignment.CENTER,
         expand=True,
     )
+    startup_flow_active = [True]
 
-    footer = ft.Container(
-        content=footer_row,
-        padding=ft.padding.symmetric(horizontal=16, vertical=10),
-        bgcolor="#0f172a",
-        border=ft.border.only(top=ft.BorderSide(1, "#1e293b")),
+    def _apply_runtime_theme(new_theme: AppTheme) -> None:
+        nonlocal theme, ACCENT
+        theme = new_theme
+        ACCENT = new_theme.accent
+        settings_state = settings_panel.export_view_state()
+
+        page.bgcolor = new_theme.page_bg
+        status_text.color = new_theme.text_muted
+        title_heading.color = new_theme.text_primary
+
+        loading_overlay.bgcolor = new_theme.page_bg
+        shutdown_overlay.bgcolor = new_theme.page_bg
+        shutdown_status_text.color = new_theme.text_muted
+
+        sort_dd.border_color = new_theme.input_border
+        sort_dd.bgcolor = new_theme.input_bg
+        sort_dd.label_style = ft.TextStyle(color=new_theme.input_label, size=12)
+        sort_dd.text_style = ft.TextStyle(color=new_theme.text_primary, size=13)
+
+        top_bar.bgcolor = new_theme.surface_bg
+        top_bar.border = ft.border.only(bottom=ft.BorderSide(1, new_theme.border_subtle))
+
+        remember_startup.active_color = ACCENT
+        auto_refresh_sw.active_color = ACCENT
+        auto_update_sw.active_color = ACCENT
+        minimize_to_tray_sw.active_color = ACCENT
+        start_with_windows_sw.active_color = ACCENT
+
+        _rebuild_settings_panel_for_theme(new_theme)
+        settings_panel.restore_view_state(settings_state)
+        content_host.controls[1] = settings_panel.overlay
+        if settings_state.get("is_open"):
+            settings_panel.toggle()
+
+        if not startup_flow_active[0]:
+            page.run_task(rebuild_devices)
+        page.update()
+
+    theme_manager.subscribe(_apply_runtime_theme)
+
+    body.content = ft.Column(
+        [
+            top_bar,
+            content_host,
+        ],
+        expand=True,
+        spacing=0,
     )
 
-    page.add(
-        ft.Column(
-            [
-                body,
-                footer,
-            ],
-            expand=True,
-            spacing=0,
-            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-        )
-    )
+    page.add(body)
 
     page.window.prevent_close = True
     page.window.on_event = on_window_event
-    sync_footer_layout()
+    sync_header_action_buttons()
     sync_caption_icons()
 
     await refresh_distros()
-    test_forced = _test_setup_dialog_requested()
     usbip_ok = await asyncio.to_thread(usbipd_cli_works, usbipd_exe)
     _no_wsl = not wsl_distro_names
-    btn_install.disabled = _no_wsl and usbip_ok
-    btn_install_icon.disabled = btn_install.disabled
+    btn_install_usbipd.disabled = _no_wsl and usbip_ok
     page.update()
-    if (not usbip_ok) or test_forced:
-        await present_usbip_setup_dialog(
-            after_install_refresh=False,
-            need_usbipd=not usbip_ok,
+
+    force_startup_setup = test_first_time_setup
+    if force_startup_setup:
+        cfg["startup_first_run_shown"] = False
+
+    def _startup_should_run() -> bool:
+        return force_startup_setup or not bool(cfg.get("startup_first_run_shown"))
+
+    # Hide the loading overlay before startup panels open
+    loading_overlay.visible = False
+    page.update()
+
+    def _update_usbipd_exe(exe: str) -> None:
+        nonlocal usbipd_exe
+        usbipd_exe = exe
+
+    shell = SetupShell(page, theme, theme_manager, overlay_host=content_host)
+    try:
+        await shell.run(
+            steps=[
+                SetupStepRegistration(
+                    key="theme",
+                    should_show=_startup_should_run,
+                    initial_completed=lambda: bool((cfg.get("theme") or "").strip()),
+                    size_resolver=calculate_theme_step_preferred_size,
+                    build_content=lambda ctx: build_theme_step_content(
+                        ctx,
+                        page=page,
+                        theme_manager=theme_manager,
+                        cfg=cfg,
+                        save_config_fn=persist_cfg,
+                    ),
+                ),
+                SetupStepRegistration(
+                    key="usb",
+                    should_show=lambda: _startup_should_run() and ((not usbip_ok) or test_first_time_setup),
+                    initial_completed=lambda: False,
+                    size_resolver=lambda page_obj, _content: calculate_usb_step_preferred_size(
+                        page_obj,
+                        test_first_time_setup=test_first_time_setup,
+                        need_usbipd=not usbip_ok,
+                        has_wsl_distros=bool(wsl_distro_names),
+                    ),
+                    build_content=lambda ctx: build_usb_step_content(
+                        ctx,
+                        page=page,
+                        cfg=cfg,
+                        wsl_distro_names=wsl_distro_names,
+                        test_first_time_setup=test_first_time_setup,
+                        install_cancel_holder=install_cancel_holder,
+                        need_usbipd=not usbip_ok,
+                        on_usbipd_updated=_update_usbipd_exe,
+                    ),
+                    on_leave=lambda direction: on_usb_step_leave(
+                        direction, install_cancel_holder=install_cancel_holder
+                    ),
+                ),
+                SetupStepRegistration(
+                    key="preferences",
+                    should_show=_startup_should_run,
+                    initial_completed=lambda: True,
+                    size_resolver=calculate_preferences_step_preferred_size,
+                    build_content=lambda ctx: build_preferences_step_content(
+                        ctx,
+                        page=page,
+                        cfg=cfg,
+                        save_config_fn=persist_cfg,
+                        auto_update_sw=auto_update_sw,
+                        start_with_windows_sw=start_with_windows_sw,
+                        start_win_available=_start_win_available,
+                        on_start_with_windows_change=on_start_with_windows_change,
+                    ),
+                ),
+            ],
         )
+    finally:
+        startup_flow_active[0] = False
+
+    if _startup_should_run():
+        cfg["startup_first_run_shown"] = True
+        cfg["theme_first_run_shown"] = True
+        save_config(cfg)
+
     loading_overlay.visible = True
     page.update()
     try:
@@ -1960,6 +1871,8 @@ async def run_app(page: ft.Page) -> None:
         await apply_remembered(quiet=True)
 
     page.run_task(poll_loop)
+    if auto_update_sw.value:
+        page.run_task(run_auto_update_check)
 
     async def on_disconnect(_: ft.ControlEvent) -> None:
         if _shutdown_started[0]:

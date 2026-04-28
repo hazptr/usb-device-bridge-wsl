@@ -25,12 +25,12 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from usbipd_attach_manager.process import run_cmd, run_cmd_stream_merged_async
-from usbipd_attach_manager.firewall import (
+from usb_device_bridge.process import run_cmd, run_cmd_stream_merged_async
+from usb_device_bridge.firewall import (
     apply_wsl_public_profile_firewall_fix,
     usbipd_output_suggests_firewall_block,
 )
-from usbipd_attach_manager.usbipd import classify
+from usb_device_bridge.usbipd import classify
 
 _WIN_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 

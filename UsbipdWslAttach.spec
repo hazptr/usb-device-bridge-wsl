@@ -1,6 +1,6 @@
 # PyInstaller spec: onedir build (exe + dependencies folder) for bundling in an installer.
 # Run from repo root:
-#   py -m PyInstaller UsbipdWslAttach.spec
+#   py -m PyInstaller UsbDeviceBridge.spec
 # Then build the setup EXE (requires Inno Setup 6):
 #   .\scripts\build_installer.ps1
 
@@ -12,7 +12,7 @@ from PyInstaller.utils.hooks import collect_all
 datas = [("assets", "assets")]
 _build_version = Path("packaging") / "build_version.txt"
 if _build_version.is_file():
-    datas += [(str(_build_version), "usbipd_attach_manager")]
+    datas += [(str(_build_version), "usb_device_bridge")]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all("flet")
@@ -52,7 +52,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="UsbipdWslAttach",
+    name="UsbDeviceBridge",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -75,5 +75,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="UsbipdWslAttach",
+    name="UsbDeviceBridge",
 )

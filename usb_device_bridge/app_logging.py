@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from usbipd_attach_manager.config import app_data_dir
+from usb_device_bridge.config import app_data_dir
 
 _CONFIGURED = False
 _FAULT_FILE: Any = None

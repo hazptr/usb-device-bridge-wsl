@@ -1,11 +1,11 @@
 """
-USB/IP (usbipd-win) → WSL attachment manager — desktop UI built with Flet.
+USB Device Bridge for WSL — desktop app to attach USB devices to Windows Subsystem for Linux.
 
 Requires: Windows, usbipd-win, WSL2, Python 3.10+.
 
   py -m pip install -r requirements.txt
   py main.py
-  py -m usbipd_attach_manager
+  py -m usb_device_bridge
 
 Settings are stored under %LOCALAPPDATA%\\usbipd-device-attach-manager\\config.json
 Logs (including uncaught exceptions) go to app.log in that folder; fatal Python fault
@@ -23,15 +23,15 @@ app is meant to keep them attached over time (see AGENTS.md). There is no
 separate toggle for that behavior.
 
 First-run setup: if usbipd-win is missing, a setup dialog runs at startup. To
-open that dialog for testing even when usbipd is installed, use
-``--test-setup-dialog`` or set environment variable
-``USBIPD_ATTACH_MANAGER_TEST_SETUP_DIALOG=1``. In that mode, when the real WinGet
-install is skipped, a short streamed PowerShell snippet (including ``winget --version``
-when available) runs first so the WinGet-style log path can be checked without
-installing packages.
+force the entire first-time startup setup sequence for testing (including setup
+dialog and theme selector), use ``--test-first-time-setup`` or set environment
+variable ``USBIPD_ATTACH_MANAGER_TEST_FIRST_TIME_SETUP=1``. In that mode, when
+the real WinGet install is skipped, a short streamed PowerShell snippet
+(including ``winget --version`` when available) runs first so the WinGet-style
+log path can be checked without installing packages.
 """
 
-from usbipd_attach_manager.cli import main
+from usb_device_bridge.cli import main
 
 if __name__ == "__main__":
     main()

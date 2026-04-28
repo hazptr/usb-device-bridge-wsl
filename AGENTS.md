@@ -58,17 +58,33 @@ py -m pip install -r requirements.txt
 py main.py
 ```
 
-Or: `py -m usbipd_attach_manager` (editable install: `py -m pip install -e .` then `usbipd-attach-ui`).
+Or: `py -m usb_device_bridge` (editable install: `py -m pip install -e .` then `usb-device-bridge`).
 
-**Shipped Windows build:** PyInstaller produces an onedir app under `dist\UsbipdWslAttach\`. **Inno Setup 6** packages that into an installer (`.\scripts\build_installer.ps1` after installing Inno Setup).
+**Shipped Windows build:** PyInstaller produces an onedir app under `dist\UsbDeviceBridge\`. **Inno Setup 6** packages that into an installer (`.\ scripts\build_installer.ps1` after installing Inno Setup).
+
+## Code organization (thematic)
+
+When adding or moving code, keep modules grouped by responsibility:
+
+- `usb_device_bridge/ui/app.py`: Main Flet app composition/orchestration (`run_app`).
+- `usb_device_bridge/ui/`: UI-focused subpackage.
+  - `ui/helpers.py`: Pure UI helper utilities (asset resolution, list fingerprinting, setup-dialog test flag parsing).
+  - `ui/settings_panel.py`: Settings overlay/tab UI controller and composition.
+  - `ui/tray.py`: Notification area (system tray) integration.
+- `usb_device_bridge/windows/`: Windows-only platform integrations.
+  - `windows/admin.py`: Elevation/UAC and process-elevation checks.
+  - `windows/startup.py`: Run-at-logon registry integration.
+- `usb_device_bridge/usbipd.py`, `wsl.py`, `firewall.py`, `process.py`: Command and platform interaction helpers.
+- `usb_device_bridge/auto_attach.py`: Remembered-device background attach coordination.
+- `usb_device_bridge/config.py`: Persistent app and per-device settings.
 
 ## Contributing
 
 1. **Scope:** Keep changes focused; avoid unrelated refactors or formatting-only churn.
 2. **Consistency:** Match patterns already in the codebase (types, structure) unless you are deliberately improving them in a focused way.
-3. **Regression check:** After edits, run `py -m compileall usbipd_attach_manager` and, when behavior or UI is touched, do a quick manual run on Windows.
+3. **Regression check:** After edits, run `py -m compileall usb_device_bridge` and, when behavior or UI is touched, do a quick manual run on Windows.
 4. **This document:** Update it when **user-visible behavior** or **product intent** changes—not for every internal refactor.
 
 If you add tests or CI, record the exact commands in the repo (e.g. README or a developer note) so others can run them.
 
-**CI (installer):** On push/PR to `main` or `master`, on **published** GitHub Releases, or via “Run workflow”, `.github/workflows/build-installer.yml` runs on `windows-latest` (PyInstaller, Chocolatey `innosetup`, `scripts\build_installer.ps1` with `USBIPD_BUILD_PYTHON=python`) and saves `dist-installer\` as a workflow artifact. For a **published** release, the same workflow sets `MyAppVersion` in `packaging\UsbipdWslAttach.iss` from the release tag (optional leading `v`, e.g. `v0.2.0` → `0.2.0`), rebuilds, then attaches the setup EXE to that release.
+**CI (installer):** On push/PR to `main` or `master`, on **published** GitHub Releases, or via "Run workflow", `.github/workflows/build-installer.yml` runs on `windows-latest` (PyInstaller, Chocolatey `innosetup`, `scripts\build_installer.ps1` with `USBIPD_BUILD_PYTHON=python`) and saves `dist-installer\` as a workflow artifact. For a **published** release, the same workflow sets `MyAppVersion` in `packaging\UsbDeviceBridge.iss` from the release tag (optional leading `v`, e.g. `v0.2.0` → `0.2.0`), rebuilds, then attaches the setup EXE to that release.

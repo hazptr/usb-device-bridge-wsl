@@ -3,9 +3,9 @@ requires = ["setuptools>=61", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "usbipd-device-attach-manager"
+name = "usb-device-bridge-wsl"
 dynamic = ["version"]
-description = "USB/IP (usbipd-win) to WSL attachment manager — Flet desktop UI; remembered devices stay attached while running (see AGENTS.md)"
+description = "USB Device Bridge for WSL — Desktop application to easily attach and manage USB devices in Windows Subsystem for Linux with automatic reconnection support"
 requires-python = ">=3.10"
 dependencies = [
     "flet>=0.24.0",
@@ -15,12 +15,12 @@ dependencies = [
 ]
 
 [project.scripts]
-usbipd-attach-ui = "usbipd_attach_manager.cli:main"
+usb-device-bridge = "usb_device_bridge.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["usbipd_attach_manager*"]
+include = ["usb_device_bridge*"]
 
 [tool.setuptools-scm]
-version_file = "usbipd_attach_manager/_version.py"
+version_file = "usb_device_bridge/_version.py"
 tag_regex = "^[vV](?P<version>[0-9]+\\.[0-9]+\\.[0-9]+(?:\\.[0-9]+)?)$"

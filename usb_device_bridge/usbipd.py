@@ -9,12 +9,12 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from usbipd_attach_manager.config import save_config
-from usbipd_attach_manager.firewall import (
+from usb_device_bridge.config import save_config
+from usb_device_bridge.firewall import (
     apply_wsl_public_profile_firewall_fix_async,
     usbipd_output_suggests_firewall_block,
 )
-from usbipd_attach_manager.process import run_cmd, run_cmd_async, run_executable_cancellable
+from usb_device_bridge.process import run_cmd, run_cmd_async, run_executable_cancellable
 
 _log = logging.getLogger(__name__)
 

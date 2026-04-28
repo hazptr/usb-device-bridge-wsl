@@ -6,7 +6,7 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from usbipd_attach_manager.process import run_cmd_async, run_cmd_stream_merged_async
+from usb_device_bridge.process import run_cmd_async, run_cmd_stream_merged_async
 
 # Official WinGet identifier (see https://github.com/dorssel/usbipd-win)
 USBIPD_WINGET_ID = "dorssel.usbipd-win"
@@ -74,7 +74,7 @@ async def winget_install_usbipd(
     return False, detail
 
 
-# ``--test-setup-dialog`` when usbipd already works: same streaming pipeline as WinGet
+# ``--test-first-time-setup`` when usbipd already works: same streaming pipeline as WinGet
 # (merged stdout/stderr via ``run_cmd_stream_merged_async``), without installing packages.
 _POWERSHELL_SETUP_STREAM_TEST = (
     "& { $ErrorActionPreference='Continue'; "

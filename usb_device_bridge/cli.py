@@ -5,14 +5,14 @@ from pathlib import Path
 
 import flet as ft
 
-from usbipd_attach_manager.app_logging import setup_logging
-from usbipd_attach_manager.single_instance import (
+from usb_device_bridge.app_logging import setup_logging
+from usb_device_bridge.single_instance import (
     prepare_single_instance,
     release_singleton_mutex_before_uac_if_needed,
     start_focus_server,
 )
-from usbipd_attach_manager.ui import run_app
-from usbipd_attach_manager.windows_admin import ensure_administrator_windows
+from usb_device_bridge.ui import run_app
+from usb_device_bridge.windows.admin import ensure_administrator_windows
 
 
 def _repo_root() -> Path:

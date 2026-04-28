@@ -59,7 +59,7 @@ def _elevated_launch_params() -> str:
         return subprocess.list2cmdline(
             ["-m", "usbipd_attach_manager", *sys.argv[1:]]
         )
-    fallback = Path(__file__).resolve().parent.parent / "main.py"
+    fallback = Path(__file__).resolve().parent.parent.parent / "main.py"
     if fallback.is_file():
         return subprocess.list2cmdline([str(fallback), *sys.argv[1:]])
     return subprocess.list2cmdline([str(entry), *sys.argv[1:]])
@@ -77,7 +77,7 @@ def ensure_administrator_windows() -> None:
     params = _elevated_launch_params()
     entry = Path(sys.argv[0]).resolve()
     if entry.is_file() and entry.name == "__main__.py":
-        cwd = str(Path(__file__).resolve().parent.parent)
+        cwd = str(Path(__file__).resolve().parent.parent.parent)
     else:
         cwd = str(entry.parent)
     ret = ctypes.windll.shell32.ShellExecuteW(

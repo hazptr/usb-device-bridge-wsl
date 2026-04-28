@@ -13,12 +13,12 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from usbipd_attach_manager.version_info import (
+from usb_device_bridge.version_info import (
     get_app_version,
     is_dev_source_launch,
     version_is_newer,
 )
-from usbipd_attach_manager.windows_admin import is_windows_process_elevated
+from usb_device_bridge.windows.admin import is_windows_process_elevated
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +282,7 @@ def _pid_appears_to_be_this_app(pid: int) -> bool:
             return False
         c = cl.lower()
         return (
-            "usbipd_attach_manager" in c
+            "usb_device_bridge" in c
             or "usbipd-attach" in c
             or "\\main.py" in cl.replace("/", "\\").lower()
         )
@@ -313,7 +313,7 @@ def _windows_candidate_same_app_pids() -> list[int]:
         exe_name,
         "python.exe",
         "pythonw.exe",
-        "usbipdwslattach.exe",
+        "usbdevicebridge.exe",
     }
     try:
         r = subprocess.run(

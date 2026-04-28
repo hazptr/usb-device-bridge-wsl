@@ -72,6 +72,7 @@ class TrayManager:
             _ensure_win32_tray_double_click_activation()
 
             image = Image.open(self._icon_path)
+
             def _call_show(icon, item) -> None:
                 if self._on_show:
                     self._on_show()

@@ -11,7 +11,7 @@ from pathlib import Path
 def is_dev_source_launch() -> bool:
     """
     True when this process is running from source (not a frozen build), e.g.
-    ``py .\\main.py`` or ``py -m usbipd_attach_manager``. Used so a running dev
+    ``py .\\main.py`` or ``py -m usb_device_bridge``. Used so a running dev
     instance always yields to a newly started one for faster iteration.
 
     Set ``USBIPD_ATTACH_DEV=1`` to force dev behavior when detection does not apply.
@@ -32,7 +32,7 @@ def is_dev_source_launch() -> bool:
         try:
             p = Path(mf).resolve()
             if p.name.lower() == "__main__.py":
-                if "usbipd_attach_manager" in [x.lower() for x in p.parts]:
+                if "usb_device_bridge" in [x.lower() for x in p.parts]:
                     return True
         except (OSError, ValueError):
             pass
@@ -44,7 +44,7 @@ def get_app_version() -> str:
     """Project / package version from setuptools-scm generated _version.py or importlib metadata."""
     # 1) Try setuptools-scm generated version file (present in dev builds from git)
     try:
-        from usbipd_attach_manager._version import __version__
+        from usb_device_bridge._version import __version__
 
         return __version__
     except Exception:
@@ -99,7 +99,7 @@ def _read_frozen_build_version() -> str | None:
     meip = getattr(sys, "_MEIPASS", None)
     if not meip:
         return None
-    p = Path(meip) / "usbipd_attach_manager" / "build_version.txt"
+    p = Path(meip) / "usb_device_bridge" / "build_version.txt"
     try:
         t = p.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
