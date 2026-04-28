@@ -53,10 +53,14 @@ def get_app_version() -> str:
     try:
         from importlib.metadata import version
 
-        return version("usbipd-device-attach-manager")
+        return version("usb-device-bridge-wsl")
     except Exception:
         pass
-    # 3) Try git describe directly (fallback for dev source runs)
+    # 3) For frozen builds, read the version embedded at PyInstaller build time
+    frozen = _read_frozen_build_version()
+    if frozen:
+        return frozen
+    # 4) Try git describe directly (fallback for dev source runs)
     g = _git_describe_text()
     if g:
         return g
