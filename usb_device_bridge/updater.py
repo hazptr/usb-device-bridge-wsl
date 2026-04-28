@@ -11,9 +11,9 @@ from pathlib import Path
 from usb_device_bridge.version_info import version_is_newer
 
 _GITHUB_LATEST_RELEASE_URL = (
-    "https://api.github.com/repos/delabrcd/usbip-attach-manager/releases/latest"
+    "https://api.github.com/repos/delabrcd/usb-device-bridge-wsl/releases/latest"
 )
-_HTTP_USER_AGENT = "usbipd-attach-manager-updater"
+_HTTP_USER_AGENT = "usb-device-bridge-updater"
 _INSTALLER_NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 

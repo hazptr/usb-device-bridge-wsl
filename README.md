@@ -27,7 +27,7 @@ A Windows desktop application that simplifies USB device sharing between Windows
 
 ### Windows Installer
 
-Download the latest installer from [releases](https://github.com/delabrcd/usbip-attach-manager/releases). Run the `.exe` file and follow the setup wizard. The app will prompt you to install any missing prerequisites.
+Download the latest installer from [releases](https://github.com/delabrcd/usb-device-bridge-wsl/releases). Run the `.exe` file and follow the setup wizard. The app will prompt you to install any missing prerequisites.
 
 ### Run from Source
 
