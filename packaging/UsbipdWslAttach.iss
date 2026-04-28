@@ -14,7 +14,9 @@
 #if !FileExists(InstallerVersionFile)
   #error "Installer version file not found: " + InstallerVersionFile + " - run build_installer.ps1 first"
 #endif
-#define MyAppVersion FileRead(InstallerVersionFile)
+#define InstallerVersionHandle FileOpen(InstallerVersionFile)
+#define MyAppVersion Trim(FileRead(InstallerVersionHandle))
+#expr FileClose(InstallerVersionHandle)
 
 [Setup]
 AppId={{8F3E2D1C-4B5A-6978-90AB-CDEF01234567}
