@@ -14,6 +14,7 @@ if (-not $python) {
 
 # Embed git describe (commits after last v* tag) for the in-app title bar; PyInstaller picks it up from packaging\build_version.txt
 $buildVerFile = Join-Path $repoRoot "packaging\build_version.txt"
+$installerVerFile = Join-Path $repoRoot "packaging\installer_version.txt"
 $oldEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 $desc = & git -C $repoRoot describe --tags --long --match "v*" --always --dirty 2>$null
@@ -32,8 +33,21 @@ if ((Test-Path -LiteralPath (Join-Path $repoRoot ".git")) -and -not $desc.EndsWi
 }
 $dirPack = Split-Path -Parent $buildVerFile
 if (-not (Test-Path -LiteralPath $dirPack)) { New-Item -ItemType Directory -Path $dirPack -Force | Out-Null }
+
+# Full git describe for app display version (e.g., "v1.0.4-0-gabc123-dirty")
 Set-Content -LiteralPath $buildVerFile -Value $desc -Encoding utf8 -NoNewline
 Write-Host "Build version (title bar / embedded): $desc" -ForegroundColor Cyan
+
+# Clean semver for installer version (e.g., "1.0.4")
+# Extract semver from tag like "v1.0.4" or "v1.0.4-0-gabc123" -> "1.0.4"
+$cleanVer = $desc -replace '^v', '' -replace '-.*$', ''
+if ($cleanVer -match '^(\d+)\.(\d+)\.(\d+)') {
+    $cleanVer = $matches[0]
+} else {
+    $cleanVer = "0.0.0"
+}
+Set-Content -LiteralPath $installerVerFile -Value $cleanVer -Encoding utf8 -NoNewline
+Write-Host "Installer version: $cleanVer" -ForegroundColor Cyan
 
 Write-Host "PyInstaller (onedir) via $python..." -ForegroundColor Cyan
 & $python -m PyInstaller --noconfirm UsbipdWslAttach.spec

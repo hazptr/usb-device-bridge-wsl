@@ -596,6 +596,96 @@ async def run_app(page: ft.Page) -> None:
             return legacy
         return wsl_distro_names[0]
 
+    _auto_fail_prompt_lock = asyncio.Lock()
+
+    async def _prompt_auto_attach_failure(
+        instance_id: str,
+        description: str,
+        bus_id: str,
+        detail: str,
+    ) -> None:
+        """Show a dialog when auto-attach gives up, offering to un-remember."""
+        async with _auto_fail_prompt_lock:
+            completed: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+            def _finish(remove: bool) -> None:
+                if completed.done():
+                    return
+                completed.set_result(remove)
+                dlg.open = False
+                page.update()
+
+            def _on_dismiss(_: ft.ControlEvent) -> None:
+                _finish(False)
+
+            try:
+                page.window.minimized = False
+                page.window.visible = True
+                page.window.skip_task_bar = False
+                await page.window.to_front()
+            except Exception:
+                pass
+
+            dlg = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Auto-Attach Failed", color="#f8fafc"),
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            f"{description} (Bus {bus_id}) could not be attached "
+                            f"to WSL after multiple attempts.",
+                            color="#cbd5e1",
+                            size=12,
+                        ),
+                        ft.Container(height=4),
+                        ft.Text(
+                            detail or "The device may not be responding correctly.",
+                            color="#94a3b8",
+                            size=11,
+                            selectable=True,
+                        ),
+                        ft.Container(height=8),
+                        ft.Text(
+                            "Would you like to remove it from your remembered "
+                            "devices, or keep it and retry later?",
+                            color="#cbd5e1",
+                            size=12,
+                        ),
+                    ],
+                    spacing=6,
+                    tight=True,
+                ),
+                actions=[
+                    ft.TextButton(
+                        "Keep & Retry",
+                        on_click=lambda _: _finish(False),
+                    ),
+                    ft.FilledButton(
+                        "Remove",
+                        on_click=lambda _: _finish(True),
+                        color="#fecaca",
+                        bgcolor="#7f1d1d",
+                    ),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+                on_dismiss=_on_dismiss,
+            )
+            page.show_dialog(dlg)
+            page.update()
+            remove = await completed
+
+            if remove:
+                ent = cfg.setdefault("devices", {}).get(instance_id)
+                if isinstance(ent, dict):
+                    ent.pop("remembered", None)
+                    prune_device_entry_if_unused(cfg, instance_id)
+                save_config(cfg)
+                auto_attach_manager.cancel_background_attach(instance_id)
+                show_ok(f"Removed {description} from remembered devices.")
+            else:
+                auto_attach_manager.retry_background_attach(instance_id)
+                show_ok(f"Will retry auto-attach for {description}.")
+
     async def rebuild_devices(
         prefetched: tuple[list[dict[str, Any]] | None, str | None] | None = None,
     ) -> None:
@@ -639,22 +729,16 @@ async def run_app(page: ft.Page) -> None:
         seen_auto_failures.intersection_update(auto_failed_ids)
         new_auto_failures = auto_failed_ids - seen_auto_failures
         if new_auto_failures:
-            failed_name = "remembered device"
-            for dev in devs:
-                inst = dev.get("InstanceId") or ""
-                if inst in new_auto_failures:
-                    failed_name = dev.get("Description") or failed_name
-                    break
-            count = len(new_auto_failures)
-            show_error(
-                (
-                    f"Auto-attach failed for {count} remembered device(s), including "
-                    f"{failed_name}."
-                )
-                if count > 1
-                else f"Auto-attach failed for remembered device: {failed_name}."
-            )
             seen_auto_failures.update(new_auto_failures)
+            by_inst_map = {
+                d.get("InstanceId") or "": d for d in devs if d.get("InstanceId")
+            }
+            for inst in sorted(new_auto_failures):
+                dev_info = by_inst_map.get(inst) or {}
+                desc = dev_info.get("Description") or "remembered device"
+                bus = dev_info.get("BusId") or "unknown"
+                detail = auto_attach_manager.failure_for_instance(inst) or ""
+                await _prompt_auto_attach_failure(inst, desc, bus, detail)
 
         async def cancel_attach_for_instance(instance_id: str) -> None:
             if not instance_id:

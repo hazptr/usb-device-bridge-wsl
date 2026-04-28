@@ -41,13 +41,26 @@ def is_dev_source_launch() -> bool:
 
 @lru_cache
 def get_app_version() -> str:
-    """Project / package version (e.g. from importlib metadata)."""
+    """Project / package version from setuptools-scm generated _version.py or importlib metadata."""
+    # 1) Try setuptools-scm generated version file (present in dev builds from git)
+    try:
+        from usbipd_attach_manager._version import __version__
+
+        return __version__
+    except Exception:
+        pass
+    # 2) Try importlib metadata (installed package)
     try:
         from importlib.metadata import version
 
         return version("usbipd-device-attach-manager")
     except Exception:
-        return "0.0.0"
+        pass
+    # 3) Try git describe directly (fallback for dev source runs)
+    g = _git_describe_text()
+    if g:
+        return g
+    return "0.0.0"
 
 
 def _repo_root() -> Path:

@@ -635,8 +635,12 @@ class AutoAttachManager:
             st = classify(dev)
 
             if st == "attached":
-                # Connected — stop the ``-a`` helper; do not spawn another.
-                self._terminate_one(inst, "already attached to client")
+                # The device is connected.  If a ``-a`` listener is still
+                # running, **leave it alone** — ``usbipd attach -a`` is
+                # designed to stay alive and re-attach on disconnect.
+                # Killing it would cause usbipd to tear down the attachment,
+                # producing an attach/detach loop.
+                self._reset_retry_state(inst)
                 continue
 
             if st in ("available", "shared") and bid:
@@ -725,13 +729,17 @@ class AutoAttachManager:
                 )
                 self._attempt_no[instance_id] = next_attempt
             else:
+                attempt_no = self._attempt_no.get(instance_id, 1)
                 _log.info(
-                    "Adopted attach -a process ended (instance_id=%s bus_id=%s pid=%s)",
+                    "Adopted attach -a process ended (instance_id=%s bus_id=%s pid=%s "
+                    "attempt=%s)",
                     instance_id,
                     bus_id,
                     pid,
+                    attempt_no,
                 )
                 del self._external_procs[instance_id]
+                self._attempt_no[instance_id] = attempt_no + 1
 
         if instance_id in self._procs:
             proc, old_bid, old_start = self._procs[instance_id]
@@ -791,20 +799,45 @@ class AutoAttachManager:
                 self._attempt_no[instance_id] = next_attempt
             else:
                 exit_code = proc.poll()
+                attempt_no = self._attempt_no.get(instance_id, 1)
                 _log.info(
-                    "usbipd attach -a process ended (exit=%s, instance_id=%s bus_id=%s)",
+                    "usbipd attach -a process ended (exit=%s, instance_id=%s bus_id=%s "
+                    "attempt=%s)",
                     exit_code,
                     instance_id,
                     bus_id,
+                    attempt_no,
                 )
                 del self._procs[instance_id]
+                if exit_code not in (None, 0):
+                    self._attempt_no[instance_id] = attempt_no + 1
 
         now = time.monotonic()
         last = self._last_spawn_mono.get(instance_id, 0.0)
-        if now - last < _MIN_RESPAWN_INTERVAL_SEC:
+        attempt_no = self._attempt_no.get(instance_id, 1)
+        if attempt_no >= _MAX_ATTACH_ATTEMPTS:
+            msg = (
+                "Auto-attach failed after multiple attempts. "
+                "Try reconnecting the device or toggle Remember off/on."
+            )
+            self._failed[instance_id] = msg
+            _log.error(
+                "Auto-attach giving up after rapid failures: "
+                "instance_id=%s bus_id=%s attempts=%s",
+                instance_id,
+                bus_id,
+                attempt_no,
+            )
+            return
+        cooldown = max(
+            _MIN_RESPAWN_INTERVAL_SEC,
+            _listener_timeout_for_attempt(attempt_no) if attempt_no > 1 else _MIN_RESPAWN_INTERVAL_SEC,
+        )
+        if now - last < cooldown:
             _log.debug(
-                "auto-attach respawn skipped (min_interval=%.1fs) instance_id=%s",
-                _MIN_RESPAWN_INTERVAL_SEC,
+                "auto-attach respawn skipped (cooldown=%.1fs attempt=%s) instance_id=%s",
+                cooldown,
+                attempt_no,
                 instance_id,
             )
             return

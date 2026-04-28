@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set Inno version from release tag
+      - name: Set version from release tag
         if: github.event_name == 'release'
         shell: pwsh
         env:
@@ -39,11 +39,10 @@ jobs:
           if ($ver -notmatch '^(0|[1-9]\d*)\.\d+\.\d+') {
             Write-Warning "Tag '$ver' is not a simple x.y.z semver; Inno/VersionInfo may not accept it."
           }
-          $iss = "packaging\UsbipdWslAttach.iss"
-          (Get-Content -LiteralPath $iss) | ForEach-Object {
-            if ($_ -match '^\#define MyAppVersion ') { '#define MyAppVersion "' + $ver + '"' } else { $_ }
-          } | Set-Content -LiteralPath $iss
-          Write-Host "MyAppVersion set to $ver (from tag $env:TAG)"
+          # Write version files for both installer and build
+          $ver | Set-Content -LiteralPath "packaging\installer_version.txt" -Encoding utf8 -NoNewline
+          $env:TAG | Set-Content -LiteralPath "packaging\build_version.txt" -Encoding utf8 -NoNewline
+          Write-Host "Version set to $ver (from tag $env:TAG)"
 
       - uses: actions/setup-python@v5
         with:
