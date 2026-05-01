@@ -1,3 +1,7 @@
+# USB Device Bridge for WSL (Python)
+
+> This Python app is archived. Please use the native Windows successor: https://github.com/delabrcd/usb-device-bridge-native
+
 # USB Device Bridge for WSL
 
 <div align="center">
@@ -58,3 +62,4 @@ Output appears in `dist-installer\`
 ## License
 
 See [LICENSE](LICENSE).
+
